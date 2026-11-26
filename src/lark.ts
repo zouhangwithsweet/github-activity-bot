@@ -20,6 +20,18 @@ async function main() {
   const shutdown = new AbortController()
   const query = configuredQuery ?? (() => Promise.reject(new Error('GitHub token is missing.')))
 
+  const secrets = [
+    appSecret,
+    process.env.GH_TOKEN?.trim(),
+    process.env.GITHUB_TOKEN?.trim(),
+    process.env.GH_ORG_TOKEN?.trim(),
+  ].filter((value): value is string => Boolean(value))
+  const redact = (text: string) =>
+    secrets.reduce(
+      (value, secret) => value.replaceAll(secret, '[redacted]'),
+      text.replace(/\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+/g, '[redacted]'),
+    )
+
   const channel = createLarkChannel({
     appId,
     appSecret,
@@ -31,19 +43,42 @@ async function main() {
   })
 
   channel.on('message', async (message) => {
+    const startedAt = performance.now()
+    const log = (event: string, fields: Record<string, string | number> = {}) => {
+      console.log(
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          event: `lark.${event}`,
+          messageId: message.messageId,
+          ...fields,
+        }),
+      )
+    }
+
     const text = await answerLarkMessage(message, {
       ownerOpenId,
       query,
       answer: (question) => answerGitHubQuestion(question, query, shutdown.signal),
       onUnconfiguredOwner: (openId) => console.log(`Received DM from open_id: ${openId}`),
+      onEvent: (entry) => {
+        if (entry.event === 'received') log(entry.event, { text: redact(entry.text) })
+        else log(entry.event, { source: entry.source })
+      },
     })
-    if (text === undefined || shutdown.signal.aborted) return
+    if (text === undefined) return
+    const durationMs = () => Math.round(performance.now() - startedAt)
+    if (shutdown.signal.aborted) {
+      log('reply_skipped', { reason: 'shutdown', durationMs: durationMs() })
+      return
+    }
 
+    const reply = redact(text)
     try {
       await channel.send(message.chatId, { text }, { replyTo: message.messageId })
+      log('reply_sent', { text: reply, durationMs: durationMs() })
     } catch (error) {
       const code = error instanceof LarkChannelError ? error.code : 'unknown'
-      console.error(`Lark reply failed (${code}).`)
+      log('reply_failed', { text: reply, code, durationMs: durationMs() })
     }
   })
   channel.on('error', () => console.error('Lark could not process an incoming event.'))

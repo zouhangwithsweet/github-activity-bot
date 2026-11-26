@@ -11,6 +11,8 @@
 
 `pnpm prs --failed` 可以单独检查 GitHub 查询。`pnpm check` 和 `pnpm test` 分别运行静态检查和测试。
 
+运行 `pnpm lark` 时，终端会按消息记录已授权的私聊问题、Bot 回复、发送结果和耗时。每条 JSON 日志带时间和原始消息 ID。
+
 ## OAR 问答
 
 本机 Codex 登录后，可私聊 Bot 问「我有哪些 PR 卡在 CI？」。Codex 不在 PATH 时，在本地 `.env` 配置 `OAR_CODEX_BIN` 为可执行文件路径。每条自然语言消息启动一个独立的 Codex 会话。`/prs` 和 `/failed` 直接走 GitHub 查询。

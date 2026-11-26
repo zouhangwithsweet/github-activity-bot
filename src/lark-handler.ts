@@ -3,11 +3,16 @@ import { hasFailingChecks, type PullRequestQuery } from './github.ts'
 
 type LarkMessage = Pick<NormalizedMessage, 'chatType' | 'senderId' | 'rawContentType' | 'content'>
 
+type ConversationEvent =
+  | { event: 'received'; text: string }
+  | { event: 'processing_failed'; source: 'codex' | 'github' }
+
 interface HandlerOptions {
   ownerOpenId: string
   query: PullRequestQuery
   answer: (question: string) => Promise<string>
   onUnconfiguredOwner: (openId: string) => void
+  onEvent?: (event: ConversationEvent) => void
 }
 
 const help =
@@ -26,6 +31,7 @@ export async function answerLarkMessage(message: LarkMessage, options: HandlerOp
 
   const question = message.content.trim()
   if (!question) return
+  options.onEvent?.({ event: 'received', text: question })
   const command = question.toLowerCase()
   const failedOnly = failedCommands.has(command)
   if (!failedOnly && !openCommands.has(command)) {
@@ -33,6 +39,7 @@ export async function answerLarkMessage(message: LarkMessage, options: HandlerOp
     try {
       return await options.answer(question)
     } catch {
+      options.onEvent?.({ event: 'processing_failed', source: 'codex' })
       return 'Codex 暂时无法完成问答。可以先用 /prs 或 /failed 查询。'
     }
   }
@@ -41,6 +48,7 @@ export async function answerLarkMessage(message: LarkMessage, options: HandlerOp
   try {
     result = await options.query()
   } catch {
+    options.onEvent?.({ event: 'processing_failed', source: 'github' })
     return 'GitHub 查询失败，请检查本地凭据和仓库权限，或稍后重试。'
   }
 

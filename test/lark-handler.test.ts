@@ -16,6 +16,7 @@ await test('owner discovery and other chats cannot trigger a GitHub query', asyn
     ownerOpenId: 'ou_owner',
     query: async () => assert.fail('Unexpected GitHub query'),
     answer: async () => assert.fail('Unexpected Codex call'),
+    onEvent: () => assert.fail('Ignored messages should not appear in conversation logs'),
     onUnconfiguredOwner: (openId: string) => discovered.push(openId),
   }
   assert.equal(await answerLarkMessage(question, { ...options, ownerOpenId: '' }), undefined)
@@ -67,4 +68,22 @@ await test('routes authorized natural language to Codex and keeps unknown slash 
   )
   assert.match((await answerLarkMessage({ ...message, content: '/help' }, options)) ?? '', /\/prs/)
   assert.deepEqual(questions, [question])
+})
+
+await test('records an authorized question before processing and reports query failures', async () => {
+  const events: string[] = []
+  const reply = await answerLarkMessage(message, {
+    ownerOpenId: 'ou_owner',
+    query: async () => {
+      events.push('query')
+      throw new Error('GitHub unavailable')
+    },
+    answer: async () => assert.fail('Fixed commands should bypass Codex'),
+    onUnconfiguredOwner: () => assert.fail('Unexpected discovery mode'),
+    onEvent: (entry) => {
+      events.push(entry.event === 'received' ? entry.text : entry.source)
+    },
+  })
+  assert.match(reply ?? '', /GitHub 查询失败/)
+  assert.deepEqual(events, ['CI 失败', 'query', 'github'])
 })
