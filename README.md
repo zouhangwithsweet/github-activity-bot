@@ -17,6 +17,8 @@
 
 本机 Codex 登录后，可私聊 Bot 问「我有哪些 PR 卡在 CI？」。Codex 不在 PATH 时，在本地 `.env` 配置 `OAR_CODEX_BIN` 为可执行文件路径。每条自然语言消息启动一个独立的 Codex 会话。`/prs` 和 `/failed` 直接走 GitHub 查询。
 
+发 GitHub PR 链接或 `owner/repo#编号`，可以问单个 PR 的描述、CI、评审和合并状态。问「这个 PR 改了什么」时，Codex 会按需读取改动文件和 diff 摘录。
+
 ## GitHub 组织仓库
 
 如需读取组织仓库，给同一个 GitHub 用户配置仅限对应组织和仓库的只读 `GH_ORG_TOKEN`，以及用逗号分隔的 `GH_EXPECTED_REPOS`。查询合并两个凭据可见的 PR，并提示其中无法访问的仓库。如果组织需要审核，审核通过后才能读取私有仓库。

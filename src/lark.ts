@@ -1,6 +1,6 @@
 import { createLarkChannel, Domain, LarkChannelError, LoggerLevel } from '@larksuiteoapi/node-sdk'
 import { answerGitHubQuestion, CodexAnswerError } from './agent.ts'
-import { createPullRequestQuery } from './github.ts'
+import { createPullRequestDetailQuery, createPullRequestQuery } from './github.ts'
 import { answerLarkMessage } from './lark-handler.ts'
 
 async function main() {
@@ -8,17 +8,20 @@ async function main() {
   const appSecret = process.env.LARK_APP_SECRET?.trim()
   const ownerOpenId = process.env.LARK_OWNER_OPEN_ID?.trim() ?? ''
   const configuredQuery = createPullRequestQuery()
+  const configuredDetailQuery = createPullRequestDetailQuery()
 
   if (!appId || !appSecret)
     throw new Error('Set LARK_APP_ID and LARK_APP_SECRET in the local environment.')
   if (ownerOpenId && !ownerOpenId.startsWith('ou_')) {
     throw new Error('LARK_OWNER_OPEN_ID must be the open_id for this Lark app.')
   }
-  if (ownerOpenId && !configuredQuery)
+  if (ownerOpenId && (!configuredQuery || !configuredDetailQuery))
     throw new Error('Set GH_TOKEN or GH_ORG_TOKEN to enable PR queries.')
 
   const shutdown = new AbortController()
-  const query = configuredQuery ?? (() => Promise.reject(new Error('GitHub token is missing.')))
+  const missingGitHubToken = () => Promise.reject(new Error('GitHub token is missing.'))
+  const query = configuredQuery ?? missingGitHubToken
+  const detail = configuredDetailQuery ?? missingGitHubToken
 
   const secrets = [
     appSecret,
@@ -59,7 +62,8 @@ async function main() {
     const text = await answerLarkMessage(message, {
       ownerOpenId,
       query,
-      answer: (question) => answerGitHubQuestion(question, query, shutdown.signal),
+      answer: (question) =>
+        answerGitHubQuestion(question, { list: query, detail }, shutdown.signal),
       onUnconfiguredOwner: (openId) => console.log(`Received DM from open_id: ${openId}`),
       onEvent: (entry) => {
         if (entry.event === 'received') {

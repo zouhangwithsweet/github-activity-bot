@@ -17,6 +17,38 @@ const openPullRequestsQuery = `
   }
 `
 
+const pullRequestDetailQuery = `
+  query PullRequestDetail($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      nameWithOwner
+      pullRequest(number: $number) {
+        number
+        title
+        body
+        url
+        state
+        isDraft
+        baseRefName
+        headRefName
+        headRefOid
+        mergeable
+        mergeStateStatus
+        reviewDecision
+        statusCheckRollup { state }
+        changedFiles
+        additions
+        deletions
+      }
+    }
+  }
+`
+
+const repositoryName = /^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/
+const filesPerPage = 10
+const maxListedFiles = 3_000
+const maxDescriptionLength = 6_000
+const maxPatchLength = 2_000
+
 export type CheckState = 'ERROR' | 'EXPECTED' | 'FAILURE' | 'PENDING' | 'SUCCESS'
 
 export interface PullRequest {
@@ -111,6 +143,78 @@ interface PullRequestSnapshot {
 
 export type PullRequestQuery = () => Promise<PullRequestSnapshot>
 
+interface PullRequestDetailNode {
+  number: number
+  title: string
+  body: string
+  url: string
+  state: 'OPEN' | 'MERGED' | 'CLOSED'
+  isDraft: boolean
+  baseRefName: string
+  headRefName: string
+  headRefOid: string
+  mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'
+  mergeStateStatus: string
+  reviewDecision: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null
+  statusCheckRollup: { state: CheckState } | null
+  changedFiles: number
+  additions: number
+  deletions: number
+}
+
+interface GitHubChangedFile {
+  filename: string
+  previous_filename?: string
+  status: string
+  additions: number
+  deletions: number
+  patch?: string | null
+}
+
+export interface PullRequestDetail extends Omit<
+  PullRequestDetailNode,
+  'isDraft' | 'statusCheckRollup'
+> {
+  repository: string
+  draft: boolean
+  checks: CheckState | null
+  bodyTruncated: boolean
+  files?: {
+    page: number
+    nextPage: number | null
+    limitedByGitHub: boolean
+    entries: {
+      path: string
+      previousPath: string | null
+      status: string
+      additions: number
+      deletions: number
+      patchExcerpt: string | null
+      patchTruncated: boolean
+    }[]
+  }
+}
+
+export type PullRequestDetailQuery = (
+  repository: string,
+  number: number,
+  filesPage?: number,
+) => Promise<PullRequestDetail | null>
+
+function githubTokens(env: NodeJS.ProcessEnv) {
+  const personalToken = env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim()
+  return [
+    ...new Set(
+      [personalToken, env.GH_ORG_TOKEN?.trim()].filter((token): token is string => Boolean(token)),
+    ),
+  ]
+}
+
+function isRepositoryName(value: string) {
+  const name = value.split('/')[1]
+  return repositoryName.test(value) && value === value.trim() && name !== '.' && name !== '..'
+}
+
 async function canReadRepositoryPullRequests(
   repository: string,
   tokens: string[],
@@ -141,12 +245,7 @@ export function createPullRequestQuery(
   env: NodeJS.ProcessEnv = process.env,
   request: typeof fetch = fetch,
 ): PullRequestQuery | undefined {
-  const personalToken = env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim()
-  const tokens = [
-    ...new Set(
-      [personalToken, env.GH_ORG_TOKEN?.trim()].filter((token): token is string => Boolean(token)),
-    ),
-  ]
+  const tokens = githubTokens(env)
   if (!tokens.length) return
 
   const expected = [
@@ -157,7 +256,7 @@ export function createPullRequestQuery(
         .filter(Boolean),
     ),
   ]
-  if (expected.some((repository) => !/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository))) {
+  if (expected.some((repository) => !isRepositoryName(repository))) {
     throw new Error('GH_EXPECTED_REPOS must contain comma-separated owner/repo names.')
   }
 
@@ -191,5 +290,145 @@ export function createPullRequestQuery(
       .filter((row) => !row.readable)
       .map((row) => row.repository)
     return { login: primary.login, pullRequests, unavailableRepositories }
+  }
+}
+
+interface PullRequestDetailResponse {
+  data?: {
+    repository: { nameWithOwner: string; pullRequest: PullRequestDetailNode | null } | null
+  } | null
+  errors?: { type?: string }[]
+}
+
+async function checkDetailResponse(response: Response) {
+  if (response.ok) return true
+  if (response.status === 404) return false
+  if (response.status === 403) {
+    const message = await response.text()
+    if (
+      response.headers.get('x-ratelimit-remaining') !== '0' &&
+      !response.headers.has('retry-after') &&
+      !/rate limit/i.test(message)
+    ) {
+      return false
+    }
+  }
+  throw new Error(`GitHub PR query returned HTTP ${response.status}.`)
+}
+
+async function getPullRequestDetail(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+  request: typeof fetch,
+) {
+  const response = await request('https://api.github.com/graphql', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      'user-agent': 'github-activity-bot',
+    },
+    body: JSON.stringify({ query: pullRequestDetailQuery, variables: { owner, repo, number } }),
+    signal: AbortSignal.timeout(20_000),
+  })
+  if (!(await checkDetailResponse(response))) return null
+
+  const result = (await response.json()) as PullRequestDetailResponse
+  if (result.errors?.length) {
+    if (result.errors.every((error) => error.type === 'NOT_FOUND' || error.type === 'FORBIDDEN')) {
+      return null
+    }
+    throw new Error('GitHub could not complete the PR detail query.')
+  }
+  if (!result.data) throw new Error('GitHub returned no PR detail data.')
+  const repository = result.data.repository
+  if (!repository?.pullRequest) return null
+
+  const { isDraft, statusCheckRollup, body, ...fields } = repository.pullRequest
+  return {
+    ...fields,
+    repository: repository.nameWithOwner,
+    draft: isDraft,
+    checks: statusCheckRollup?.state ?? null,
+    body: body.slice(0, maxDescriptionLength),
+    bodyTruncated: body.length > maxDescriptionLength,
+  }
+}
+
+async function getPullRequestFiles(
+  token: string,
+  pr: PullRequestDetail,
+  page: number,
+  request: typeof fetch,
+): Promise<NonNullable<PullRequestDetail['files']> | null> {
+  const response = await request(
+    `https://api.github.com/repos/${pr.repository}/pulls/${pr.number}/files?per_page=${filesPerPage}&page=${page}`,
+    {
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/vnd.github+json',
+        'user-agent': 'github-activity-bot',
+      },
+      signal: AbortSignal.timeout(20_000),
+    },
+  )
+  if (!(await checkDetailResponse(response))) return null
+  const files = (await response.json()) as GitHubChangedFile[]
+  return {
+    page,
+    nextPage:
+      page * filesPerPage < maxListedFiles &&
+      /;\s*rel="next"/i.test(response.headers.get('link') ?? '')
+        ? page + 1
+        : null,
+    limitedByGitHub: pr.changedFiles > maxListedFiles,
+    entries: files.map((file) => ({
+      path: file.filename,
+      previousPath: file.previous_filename ?? null,
+      status: file.status,
+      additions: file.additions,
+      deletions: file.deletions,
+      patchExcerpt: file.patch?.slice(0, maxPatchLength) ?? null,
+      patchTruncated: (file.patch?.length ?? 0) > maxPatchLength,
+    })),
+  }
+}
+
+export function createPullRequestDetailQuery(
+  env: NodeJS.ProcessEnv = process.env,
+  request: typeof fetch = fetch,
+): PullRequestDetailQuery | undefined {
+  const tokens = githubTokens(env)
+  if (!tokens.length) return
+
+  return async (repository, number, filesPage) => {
+    if (!isRepositoryName(repository))
+      throw new Error('Expected a GitHub repository as owner/repo.')
+    // GraphQL Int is a signed 32-bit integer.
+    if (!Number.isInteger(number) || number < 1 || number > 2_147_483_647) {
+      throw new Error('Expected a valid positive PR number.')
+    }
+    if (
+      filesPage !== undefined &&
+      (!Number.isInteger(filesPage) || filesPage < 1 || filesPage > maxListedFiles / filesPerPage)
+    ) {
+      throw new Error('Expected a file page between 1 and 300.')
+    }
+
+    const [owner, repo] = repository.split('/')
+    let filesUnavailable = false
+    for (const token of tokens) {
+      const detail = await getPullRequestDetail(token, owner, repo, number, request)
+      if (!detail) continue
+      if (filesPage === undefined) return detail
+
+      const files = await getPullRequestFiles(token, detail, filesPage, request)
+      if (files) return { ...detail, files }
+      filesUnavailable = true
+    }
+    if (filesUnavailable) throw new Error('GitHub credentials could not read the changed files.')
+    return null
   }
 }
