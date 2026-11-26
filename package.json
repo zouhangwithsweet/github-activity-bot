@@ -1,0 +1,25 @@
+{
+  "name": "github-activity-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prs": "node --env-file-if-exists=.env src/cli.ts",
+    "lark": "node --env-file-if-exists=.env src/lark.ts",
+    "check": "vp check",
+    "format": "vp fmt .",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.77.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.4",
+    "typescript": "^6.0.3",
+    "vite-plus": "1.5.0"
+  },
+  "engines": {
+    "node": "^24.11.0 || >=26.0.0"
+  },
+  "packageManager": "pnpm@10.34.6"
+}
