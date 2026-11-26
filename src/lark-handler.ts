@@ -1,11 +1,11 @@
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk'
-import { hasFailingChecks, type listOpenPullRequests } from './github.ts'
+import { hasFailingChecks, type PullRequestQuery } from './github.ts'
 
 type LarkMessage = Pick<NormalizedMessage, 'chatType' | 'senderId' | 'rawContentType' | 'content'>
 
 interface HandlerOptions {
   ownerOpenId: string
-  query: () => ReturnType<typeof listOpenPullRequests>
+  query: PullRequestQuery
   answer: (question: string) => Promise<string>
   onUnconfiguredOwner: (openId: string) => void
 }
@@ -50,5 +50,10 @@ export async function answerLarkMessage(message: LarkMessage, options: HandlerOp
     const draft = pr.draft ? ' · 草稿' : ''
     return `[${pr.checks ?? '无检查数据'}${draft}] ${pr.repository}#${pr.number} ${pr.title}\n${pr.url}`
   })
-  return [`@${result.login} · ${selected.length} 个${label}`, ...rows].join('\n\n')
+  const header = `@${result.login} · 当前凭据可见 ${selected.length} 个${label}`
+  const unavailable = result.unavailableRepositories
+  const coverage = unavailable.length
+    ? [`结果不完整。无法读取 ${unavailable.join('、')} 的 PR。`]
+    : []
+  return [header, ...coverage, ...rows].join('\n\n')
 }

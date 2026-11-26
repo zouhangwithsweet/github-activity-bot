@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { listOpenPullRequests } from '../src/github.ts'
+import { createPullRequestQuery, listOpenPullRequests } from '../src/github.ts'
 
 await test('collects both pages and keeps unavailable check data distinct from failure', async () => {
   const cursors: unknown[] = []
@@ -57,4 +57,55 @@ await test('does not treat an authorization error in an HTTP 200 response as an 
     })
 
   await assert.rejects(listOpenPullRequests('test-token', request), /Resource not accessible/)
+})
+
+await test('reports org PRs as unavailable until an authorized token can read them', async () => {
+  const repo = 'example/private-repo'
+  const pr = {
+    number: 65,
+    title: 'Add preferences',
+    url: 'https://github.com/example/private-repo/pull/65',
+    isDraft: false,
+    repository: { nameWithOwner: repo },
+    statusCheckRollup: { state: 'FAILURE' },
+  }
+  const request: typeof fetch = async (input, init) => {
+    const authorization = new Headers(init?.headers).get('authorization')
+    if (input === 'https://api.github.com/graphql') {
+      return Response.json({
+        data: {
+          viewer: {
+            login: 'demo',
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: authorization === 'Bearer org-token' ? [pr] : [],
+            },
+          },
+        },
+      })
+    }
+    assert.equal(
+      input,
+      'https://api.github.com/repos/example/private-repo/pulls?state=open&per_page=1',
+    )
+    return new Response(null, { status: 404 })
+  }
+
+  const env = { GH_TOKEN: 'personal-token', GH_EXPECTED_REPOS: repo }
+  const personal = createPullRequestQuery(env, request)
+  assert.ok(personal)
+  assert.deepEqual(await personal(), {
+    login: 'demo',
+    pullRequests: [],
+    unavailableRepositories: [repo],
+  })
+
+  const withOrg = createPullRequestQuery({ ...env, GH_ORG_TOKEN: 'org-token' }, request)
+  assert.ok(withOrg)
+  const result = await withOrg()
+  assert.deepEqual(
+    result.pullRequests.map((row) => [row.number, row.checks]),
+    [[65, 'FAILURE']],
+  )
+  assert.deepEqual(result.unavailableRepositories, [])
 })

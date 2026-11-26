@@ -102,3 +102,94 @@ export async function listOpenPullRequests(token: string, request: typeof fetch 
     after = pageInfo.endCursor
   }
 }
+
+interface PullRequestSnapshot {
+  login: string
+  pullRequests: PullRequest[]
+  unavailableRepositories: string[]
+}
+
+export type PullRequestQuery = () => Promise<PullRequestSnapshot>
+
+async function canReadRepositoryPullRequests(
+  repository: string,
+  tokens: string[],
+  request: typeof fetch,
+) {
+  for (const token of tokens) {
+    const response = await request(
+      `https://api.github.com/repos/${repository}/pulls?state=open&per_page=1`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: 'application/vnd.github+json',
+          'user-agent': 'github-activity-bot',
+        },
+        signal: AbortSignal.timeout(10_000),
+      },
+    )
+    await response.body?.cancel()
+    if (response.ok) return true
+    if (response.status !== 403 && response.status !== 404) {
+      throw new Error(`Could not check PR access for ${repository}: HTTP ${response.status}.`)
+    }
+  }
+  return false
+}
+
+export function createPullRequestQuery(
+  env: NodeJS.ProcessEnv = process.env,
+  request: typeof fetch = fetch,
+): PullRequestQuery | undefined {
+  const personalToken = env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim()
+  const tokens = [
+    ...new Set(
+      [personalToken, env.GH_ORG_TOKEN?.trim()].filter((token): token is string => Boolean(token)),
+    ),
+  ]
+  if (!tokens.length) return
+
+  const expected = [
+    ...new Set(
+      (env.GH_EXPECTED_REPOS ?? '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  ]
+  if (expected.some((repository) => !/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository))) {
+    throw new Error('GH_EXPECTED_REPOS must contain comma-separated owner/repo names.')
+  }
+
+  return async () => {
+    const [primary, ...additional] = await Promise.all(
+      tokens.map((token) => listOpenPullRequests(token, request)),
+    )
+    const merged = new Map<string, PullRequest>()
+    for (const result of [primary, ...additional]) {
+      if (result.login.toLowerCase() !== primary.login.toLowerCase()) {
+        throw new Error('GitHub personal and organization tokens must belong to the same account.')
+      }
+      for (const pr of result.pullRequests) {
+        const key = `${pr.repository.toLowerCase()}#${pr.number}`
+        const existing = merged.get(key)
+        if (!existing || (existing.checks === null && pr.checks !== null)) merged.set(key, pr)
+      }
+    }
+
+    const pullRequests = [...merged.values()]
+    const visible = new Set(pullRequests.map((pr) => pr.repository.toLowerCase()))
+    const coverage = await Promise.all(
+      expected.map(async (repository) => {
+        const readable =
+          visible.has(repository.toLowerCase()) ||
+          (await canReadRepositoryPullRequests(repository, tokens, request))
+        return { repository, readable }
+      }),
+    )
+    const unavailableRepositories = coverage
+      .filter((row) => !row.readable)
+      .map((row) => row.repository)
+    return { login: primary.login, pullRequests, unavailableRepositories }
+  }
+}

@@ -1,4 +1,4 @@
-import { hasFailingChecks, listOpenPullRequests } from './github.ts'
+import { createPullRequestQuery, hasFailingChecks } from './github.ts'
 
 async function main() {
   const args = process.argv.slice(2)
@@ -10,18 +10,21 @@ async function main() {
     throw new Error('Unknown argument. Use pnpm prs --help.')
   }
 
-  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim()
-  if (!token) {
-    throw new Error('Set GH_TOKEN in the environment or in a local .env file.')
+  const query = createPullRequestQuery()
+  if (!query) {
+    throw new Error('Set GH_TOKEN or GH_ORG_TOKEN in the environment or in a local .env file.')
   }
 
-  const { login, pullRequests } = await listOpenPullRequests(token)
+  const { login, pullRequests, unavailableRepositories } = await query()
   const failedOnly = args.includes('--failed')
   const selected = failedOnly ? pullRequests.filter(hasFailingChecks) : pullRequests
 
   console.log(
-    `@${login} · ${selected.length} open PR(s)${failedOnly ? ' with failing checks' : ''}`,
+    `@${login} · ${selected.length} visible open PR(s)${failedOnly ? ' with failing checks' : ''}`,
   )
+  if (unavailableRepositories.length) {
+    console.log(`Incomplete results. Cannot read PRs in: ${unavailableRepositories.join(', ')}.`)
+  }
   for (const pr of selected) {
     const draft = pr.draft ? ' [DRAFT]' : ''
     console.log(

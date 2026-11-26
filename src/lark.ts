@@ -1,23 +1,24 @@
 import { createLarkChannel, Domain, LarkChannelError, LoggerLevel } from '@larksuiteoapi/node-sdk'
 import { answerGitHubQuestion } from './agent.ts'
-import { listOpenPullRequests } from './github.ts'
+import { createPullRequestQuery } from './github.ts'
 import { answerLarkMessage } from './lark-handler.ts'
 
 async function main() {
   const appId = process.env.LARK_APP_ID?.trim()
   const appSecret = process.env.LARK_APP_SECRET?.trim()
   const ownerOpenId = process.env.LARK_OWNER_OPEN_ID?.trim() ?? ''
-  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim()
+  const configuredQuery = createPullRequestQuery()
 
   if (!appId || !appSecret)
     throw new Error('Set LARK_APP_ID and LARK_APP_SECRET in the local environment.')
   if (ownerOpenId && !ownerOpenId.startsWith('ou_')) {
     throw new Error('LARK_OWNER_OPEN_ID must be the open_id for this Lark app.')
   }
-  if (ownerOpenId && !token) throw new Error('Set GH_TOKEN or GITHUB_TOKEN to enable PR queries.')
+  if (ownerOpenId && !configuredQuery)
+    throw new Error('Set GH_TOKEN or GH_ORG_TOKEN to enable PR queries.')
 
   const shutdown = new AbortController()
-  const query = () => listOpenPullRequests(token ?? '')
+  const query = configuredQuery ?? (() => Promise.reject(new Error('GitHub token is missing.')))
 
   const channel = createLarkChannel({
     appId,

@@ -37,12 +37,14 @@ await test('returns only failed checks and PR links for an authorized private me
     ownerOpenId: 'ou_owner',
     query: async () => ({
       login: 'demo',
+      unavailableRepositories: ['example/private-repo'],
       pullRequests: [failing, { ...failing, number: 43, checks: null }],
     }),
     answer: async () => assert.fail('Fixed commands should bypass Codex'),
     onUnconfiguredOwner: () => assert.fail('Unexpected discovery mode'),
   })
   assert.match(reply ?? '', /1 个检查失败的开放 PR/)
+  assert.match(reply ?? '', /结果不完整。无法读取 example\/private-repo 的 PR/)
   assert.match(reply ?? '', /example\/bot\/pull\/42/)
   assert.doesNotMatch(reply ?? '', /#43/)
 })
