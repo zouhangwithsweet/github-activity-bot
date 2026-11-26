@@ -6,10 +6,12 @@ type LarkMessage = Pick<NormalizedMessage, 'chatType' | 'senderId' | 'rawContent
 interface HandlerOptions {
   ownerOpenId: string
   query: () => ReturnType<typeof listOpenPullRequests>
+  answer: (question: string) => Promise<string>
   onUnconfiguredOwner: (openId: string) => void
 }
 
-const help = '发「我的 PR」或 /prs 查看开放的 PR。\n发「CI 失败」或 /failed 只看检查失败的 PR。'
+const help =
+  '发 /prs 查看开放的 PR，或发 /failed 查看 CI 失败的 PR。也可以直接问「我有哪些 PR 卡在 CI？」。'
 const openCommands = new Set(['我的 pr', '/prs'])
 const failedCommands = new Set(['ci 失败', '/failed'])
 
@@ -22,9 +24,18 @@ export async function answerLarkMessage(message: LarkMessage, options: HandlerOp
   }
   if (message.senderId !== options.ownerOpenId) return
 
-  const command = message.content.trim().toLowerCase()
+  const question = message.content.trim()
+  if (!question) return
+  const command = question.toLowerCase()
   const failedOnly = failedCommands.has(command)
-  if (!failedOnly && !openCommands.has(command)) return help
+  if (!failedOnly && !openCommands.has(command)) {
+    if (command.startsWith('/')) return help
+    try {
+      return await options.answer(question)
+    } catch {
+      return 'Codex 暂时无法完成问答。可以先用 /prs 或 /failed 查询。'
+    }
+  }
 
   let result: Awaited<ReturnType<HandlerOptions['query']>>
   try {

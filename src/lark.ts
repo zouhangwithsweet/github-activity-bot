@@ -1,4 +1,5 @@
 import { createLarkChannel, Domain, LarkChannelError, LoggerLevel } from '@larksuiteoapi/node-sdk'
+import { answerGitHubQuestion } from './agent.ts'
 import { listOpenPullRequests } from './github.ts'
 import { answerLarkMessage } from './lark-handler.ts'
 
@@ -15,6 +16,9 @@ async function main() {
   }
   if (ownerOpenId && !token) throw new Error('Set GH_TOKEN or GITHUB_TOKEN to enable PR queries.')
 
+  const shutdown = new AbortController()
+  const query = () => listOpenPullRequests(token ?? '')
+
   const channel = createLarkChannel({
     appId,
     appSecret,
@@ -28,10 +32,11 @@ async function main() {
   channel.on('message', async (message) => {
     const text = await answerLarkMessage(message, {
       ownerOpenId,
-      query: () => listOpenPullRequests(token ?? ''),
+      query,
+      answer: (question) => answerGitHubQuestion(question, query, shutdown.signal),
       onUnconfiguredOwner: (openId) => console.log(`Received DM from open_id: ${openId}`),
     })
-    if (text === undefined) return
+    if (text === undefined || shutdown.signal.aborted) return
 
     try {
       await channel.send(message.chatId, { text }, { replyTo: message.messageId })
@@ -57,6 +62,7 @@ async function main() {
     )
   }
   const stop = () => {
+    shutdown.abort()
     void channel.disconnect().catch(() => {
       console.error('Could not close the Lark connection.')
       process.exitCode = 1

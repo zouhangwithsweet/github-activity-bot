@@ -1,6 +1,6 @@
 # GitHub Activity Bot
 
-通过 Lark 私聊查询自己创建的开放 PR 和 CI 状态。OAR 问答和主动提醒将在此查询层之上接入。
+通过 Lark 私聊查询自己创建的开放 PR 和 CI 状态。自然语言问题由 OAR 交给本机 Codex，并通过只读 GitHub 工具获取实时数据。
 
 ## 本地运行
 
@@ -10,3 +10,7 @@
 4. 首次私聊 Bot 时，终端会显示你的 `open_id`。填入 `LARK_OWNER_OPEN_ID` 并重启。发送「我的 PR」或「CI 失败」验证。
 
 `pnpm prs --failed` 可以单独检查 GitHub 查询。`pnpm check` 和 `pnpm test` 分别运行静态检查和测试。
+
+## OAR 问答
+
+本机 Codex 登录后，可私聊 Bot 问「我有哪些 PR 卡在 CI？」。Codex 不在 PATH 时，在本地 `.env` 配置 `OAR_CODEX_BIN` 为可执行文件路径。每条自然语言消息启动一个独立的 Codex 会话。`/prs` 和 `/failed` 直接走 GitHub 查询。
