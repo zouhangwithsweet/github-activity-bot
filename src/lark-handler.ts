@@ -5,7 +5,8 @@ type LarkMessage = Pick<NormalizedMessage, 'chatType' | 'senderId' | 'rawContent
 
 type ConversationEvent =
   | { event: 'received'; text: string }
-  | { event: 'processing_failed'; source: 'codex' | 'github' }
+  | { event: 'processing_failed'; source: 'codex'; error: unknown }
+  | { event: 'processing_failed'; source: 'github' }
 
 interface HandlerOptions {
   ownerOpenId: string
@@ -38,8 +39,8 @@ export async function answerLarkMessage(message: LarkMessage, options: HandlerOp
     if (command.startsWith('/')) return help
     try {
       return await options.answer(question)
-    } catch {
-      options.onEvent?.({ event: 'processing_failed', source: 'codex' })
+    } catch (error) {
+      options.onEvent?.({ event: 'processing_failed', source: 'codex', error })
       return 'Codex 暂时无法完成问答。可以先用 /prs 或 /failed 查询。'
     }
   }

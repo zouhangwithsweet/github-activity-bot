@@ -87,3 +87,26 @@ await test('records an authorized question before processing and reports query f
   assert.match(reply ?? '', /GitHub 查询失败/)
   assert.deepEqual(events, ['CI 失败', 'query', 'github'])
 })
+
+await test('keeps Codex failure details available to the terminal logger', async () => {
+  const failure = new Error('MCP initialization failed')
+  const errors: unknown[] = []
+  const reply = await answerLarkMessage(
+    { ...message, content: '哪些 PR 卡在 CI？' },
+    {
+      ownerOpenId: 'ou_owner',
+      query: async () => assert.fail('Unexpected direct GitHub query'),
+      answer: async () => {
+        throw failure
+      },
+      onUnconfiguredOwner: () => assert.fail('Unexpected discovery mode'),
+      onEvent: (entry) => {
+        if (entry.event === 'processing_failed' && entry.source === 'codex')
+          errors.push(entry.error)
+      },
+    },
+  )
+  assert.deepEqual(errors, [failure])
+  assert.match(reply ?? '', /可以先用 \/prs 或 \/failed 查询/)
+  assert.doesNotMatch(reply ?? '', /MCP/)
+})

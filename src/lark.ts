@@ -1,5 +1,5 @@
 import { createLarkChannel, Domain, LarkChannelError, LoggerLevel } from '@larksuiteoapi/node-sdk'
-import { answerGitHubQuestion } from './agent.ts'
+import { answerGitHubQuestion, CodexAnswerError } from './agent.ts'
 import { createPullRequestQuery } from './github.ts'
 import { answerLarkMessage } from './lark-handler.ts'
 
@@ -44,7 +44,8 @@ async function main() {
 
   channel.on('message', async (message) => {
     const startedAt = performance.now()
-    const log = (event: string, fields: Record<string, string | number> = {}) => {
+    const durationMs = () => Math.round(performance.now() - startedAt)
+    const log = (event: string, fields: Record<string, string | number | undefined> = {}) => {
       console.log(
         JSON.stringify({
           timestamp: new Date().toISOString(),
@@ -61,12 +62,20 @@ async function main() {
       answer: (question) => answerGitHubQuestion(question, query, shutdown.signal),
       onUnconfiguredOwner: (openId) => console.log(`Received DM from open_id: ${openId}`),
       onEvent: (entry) => {
-        if (entry.event === 'received') log(entry.event, { text: redact(entry.text) })
-        else log(entry.event, { source: entry.source })
+        if (entry.event === 'received') {
+          log(entry.event, { text: redact(entry.text) })
+          return
+        }
+        const diagnostic =
+          entry.source === 'codex'
+            ? entry.error instanceof CodexAnswerError
+              ? entry.error.diagnostic
+              : { code: 'unexpected_error' }
+            : {}
+        log(entry.event, { source: entry.source, ...diagnostic, durationMs: durationMs() })
       },
     })
     if (text === undefined) return
-    const durationMs = () => Math.round(performance.now() - startedAt)
     if (shutdown.signal.aborted) {
       log('reply_skipped', { reason: 'shutdown', durationMs: durationMs() })
       return

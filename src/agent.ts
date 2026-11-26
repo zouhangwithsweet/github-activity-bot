@@ -8,7 +8,7 @@ import type { PullRequestQuery } from './github.ts'
 
 const codex = defaultRuntimes.require('codex')
 const runFile = promisify(execFile)
-const credentials = {
+const removedCredentials = {
   GH_TOKEN: null,
   GH_ORG_TOKEN: null,
   GITHUB_TOKEN: null,
@@ -40,9 +40,51 @@ const launchArgs = [
   'web_search="disabled"',
 ]
 
+type CodexStage = 'installation' | 'mcp_config' | 'mcp_server' | 'session_start' | 'turn'
+
+export class CodexAnswerError extends Error {
+  readonly diagnostic: { stage: CodexStage; code: string; status?: number; rpcCode?: number }
+
+  constructor(diagnostic: CodexAnswerError['diagnostic']) {
+    super(`Codex ${diagnostic.stage} failed (${diagnostic.code}).`)
+    this.diagnostic = diagnostic
+  }
+}
+
+async function atCodexStage<T>(stage: CodexStage, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run()
+  } catch (error) {
+    // Native error messages may contain request details. Keep only classified diagnostics.
+    const cause = error instanceof Error ? error.cause : undefined
+    const native =
+      typeof cause === 'object' && cause && 'native' in cause ? cause.native : undefined
+    if (
+      typeof native === 'object' &&
+      native &&
+      'code' in native &&
+      typeof native.code === 'number'
+    ) {
+      const code =
+        error instanceof Error && /mcp/i.test(error.message) ? 'mcp_startup' : 'rpc_error'
+      throw new CodexAnswerError({ stage, code, rpcCode: native.code })
+    }
+    const code =
+      error instanceof Error &&
+      'code' in error &&
+      typeof error.code === 'string' &&
+      /^E[A-Z0-9]{2,20}$/.test(error.code)
+        ? error.code
+        : error instanceof Error && error.name === 'AbortError'
+          ? 'aborted'
+          : 'error'
+    throw new CodexAnswerError({ stage, code })
+  }
+}
+
 async function disabledMcpServers(command: string, cwd: string, signal?: AbortSignal) {
   const env = { ...process.env }
-  for (const key of Object.keys(credentials)) delete env[key]
+  for (const key of Object.keys(removedCredentials)) delete env[key]
 
   // Codex merges a session's MCP servers with its native configuration.
   const { stdout } = await runFile(command, [...launchArgs, 'mcp', 'list', '--json'], {
@@ -74,46 +116,67 @@ export async function answerGitHubQuestion(
   signal?: AbortSignal,
 ) {
   signal?.throwIfAborted()
-  const installation = await codex.installation?.({ env: credentials })
+  const installation = await atCodexStage('installation', async () =>
+    codex.installation?.({ env: removedCredentials }),
+  )
   if (installation?.kind !== 'available' || installation.via !== 'executable') {
-    throw new Error(
-      'Codex is unavailable. Set OAR_CODEX_BIN to a Codex executable or add Codex to PATH.',
-    )
+    throw new CodexAnswerError({
+      stage: 'installation',
+      code: installation?.kind === 'unsupported' ? installation.code : 'not_found',
+    })
   }
 
   const cwd = await mkdtemp(join(tmpdir(), 'github-activity-agent-'))
   try {
-    const disabled = await disabledMcpServers(installation.command, cwd, signal)
+    const disabled = await atCodexStage('mcp_config', () =>
+      disabledMcpServers(installation.command, cwd, signal),
+    )
     signal?.throwIfAborted()
-    const tools = await serveMcpTools({
-      name: 'github_activity_bot',
-      tools: [
-        {
-          name: 'list_my_open_prs',
-          description:
-            'Get the signed-in GitHub user’s open pull requests and each PR’s current CI summary.',
-          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-          annotations: { readOnlyHint: true },
-          handler: async (input) => {
-            if (Object.keys(input).length > 0) throw new Error('This tool takes no arguments.')
-            try {
-              return JSON.stringify(await query())
-            } catch {
-              throw new Error('GitHub query failed. The current PR and CI states are unavailable.')
-            }
+    const tools = await atCodexStage('mcp_server', () =>
+      serveMcpTools({
+        name: 'github_activity_bot',
+        tools: [
+          {
+            name: 'list_my_open_prs',
+            description:
+              'Get the signed-in GitHub user’s open pull requests and each PR’s current CI summary.',
+            inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+            annotations: { readOnlyHint: true },
+            handler: async (input) => {
+              if (Object.keys(input).length > 0) throw new Error('This tool takes no arguments.')
+              try {
+                return JSON.stringify(await query())
+              } catch {
+                throw new Error(
+                  'GitHub query failed. The current PR and CI states are unavailable.',
+                )
+              }
+            },
           },
-        },
-      ],
-    })
+        ],
+      }),
+    )
 
     try {
-      const session = await codex.session(installation, {
-        cwd,
-        env: credentials,
-        launchArgs: [...launchArgs, ...disabled],
-        appendSystemPrompt: instructions,
-        mcpServers: [tools.server],
-      })
+      // The tool server runs on loopback. Codex can pick up the system proxy even
+      // when the parent shell has no proxy environment variables.
+      const noProxy = [
+        ...new Set(
+          [process.env.NO_PROXY, process.env.no_proxy, '127.0.0.1,localhost,::1']
+            .flatMap((value) => value?.split(',') ?? [])
+            .map((entry) => entry.trim())
+            .filter(Boolean),
+        ),
+      ].join(',')
+      const session = await atCodexStage('session_start', () =>
+        codex.session(installation, {
+          cwd,
+          env: { ...removedCredentials, NO_PROXY: noProxy, no_proxy: noProxy },
+          launchArgs: [...launchArgs, ...disabled],
+          appendSystemPrompt: instructions,
+          mcpServers: [tools.server],
+        }),
+      )
 
       try {
         signal?.throwIfAborted()
@@ -128,12 +191,24 @@ export async function answerGitHubQuestion(
           }
         })
         try {
-          const run = await promptAndWait(session, question, { timeoutMs: 90_000, signal })
-          if (run.kind !== 'ended' || run.outcome.kind !== 'completed') {
-            throw new Error('Codex did not complete its reply.')
+          const run = await atCodexStage('turn', () =>
+            promptAndWait(session, question, { timeoutMs: 90_000, signal }),
+          )
+          if (run.kind !== 'ended') {
+            const code =
+              run.kind === 'rejected' ? run.code : run.kind === 'interrupted' ? run.by : run.kind
+            throw new CodexAnswerError({ stage: 'turn', code })
+          }
+          if (run.outcome.kind !== 'completed') {
+            const { outcome } = run
+            throw new CodexAnswerError(
+              outcome.kind === 'failed'
+                ? { stage: 'turn', code: outcome.failure, status: outcome.status }
+                : { stage: 'turn', code: 'aborted' },
+            )
           }
           const answer = (finalText || run.text).trim()
-          if (!answer) throw new Error('Codex completed without a reply.')
+          if (!answer) throw new CodexAnswerError({ stage: 'turn', code: 'empty_reply' })
           return answer
         } finally {
           unsubscribe()
