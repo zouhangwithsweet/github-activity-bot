@@ -14,6 +14,8 @@
 
 菜单栏应用通过 MyGo 管理本机的 Bot。它显示启动和运行状态，提供启动、暂停、恢复、重启和设置。暂停会让 Node Bot 退出并保留 SQLite 数据，恢复会重新连接 Lark。
 
+使用 Git 工作区启动时，运行状态会显示启动时的提交。启动失败可在菜单栏查看脱敏后的错误，连接超过启动期限时应用会结束本次启动。
+
 1. 在项目根目录运行 `pnpm install`。已有的 Node 24.11+ LTS 或 26+、Codex 和 `.env` 可以继续使用。
 2. 安装 Go 1.27.3 或更新版本，在项目根目录运行 `pnpm desktop:build`。从 `apps/desktop/dist/darwin-<架构>/` 打开 `GitHub Activity Bot.app`。
 3. 在「设置 → 运行」选择仓库根目录和 Node 可执行文件。运行 `node -p 'process.execPath'` 可查看 Node 的实际路径。如果从 Finder 启动时找不到 Codex，也可以在同一页填入 Codex 的绝对路径。
@@ -103,7 +105,9 @@ SQLite 默认保存在 `~/.local/state/github-activity-bot`，可通过 `LARK_ME
 | `GH_STAR_REPO_SOURCE=accessible` | 凭据能列出的自有仓库、协作仓库和组织仓库。 |
 | `GH_STAR_REPOSITORIES=owner/repo,owner/another-repo` | 指定仓库。可单独使用，或加到前两种范围中。 |
 
-默认每 5 分钟读取一次，可以用 `GH_STAR_POLL_SECONDS` 调整。每个仓库首次读取时只记录基线。后续发现总数增长时，按仓库私聊发出净增量和当前总数，重启后沿用已有基线。同一轮的加星与取消 Star 会反映在净增量里。已配置 Webhook 的仓库通过 Webhook 接收逐条 Star 事件。
+默认每 5 分钟读取一次，可以用 `GH_STAR_POLL_SECONDS` 调整。每个仓库首次读取时只记录基线。后续发现总数增长时，按仓库私聊发出净增量和当前总数，重启后沿用已有基线。同一轮的加星与取消 Star 会反映在净增量里。
+
+同时配置 Star 轮询和 GitHub App Webhook 时，Star 默认继续走轮询，即使同一个仓库使用 CI Webhook。确认 GitHub App 已订阅 Star 后，设 `GH_STAR_WEBHOOK=1` 可让该 Webhook 仓库改走逐条 Star 事件。切回轮询时重新建立计数基线。仅配置 Webhook 时默认接收 Star 事件，用 `GH_STAR_WEBHOOK=0` 可关闭。
 
 ## GitHub App Webhook
 

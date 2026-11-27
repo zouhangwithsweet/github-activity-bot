@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,12 +70,29 @@ func (c *botController) start(restart bool) error {
 		WorkDir:  cfg.WorkspacePath,
 		Args:     []string{"--env-file-if-exists=.env", entrypoint},
 		Env:      env,
-		Log:      io.Discard,
+		Revision: workspaceRevision(cfg.WorkspacePath),
 	})
 	c.currentMu.Lock()
 	c.current = next
 	c.currentMu.Unlock()
 	return next.Start()
+}
+
+func workspaceRevision(workspace string) string {
+	if _, err := os.Stat(filepath.Join(workspace, ".git")); err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "git", "-C", workspace, "rev-parse", "--short=8", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	revision := strings.TrimSpace(string(output))
+	if len(revision) < 8 || len(revision) > 16 || strings.Trim(revision, "0123456789abcdef") != "" {
+		return ""
+	}
+	return revision
 }
 
 func (c *botController) stop() error {

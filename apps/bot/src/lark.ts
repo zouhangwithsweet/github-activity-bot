@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { createLarkChannel, Domain, LarkChannelError, LoggerLevel } from '@larksuiteoapi/node-sdk'
+import { createLarkChannel, Domain, LarkChannelError } from '@larksuiteoapi/node-sdk'
 import { CodexAnswerError, openGitHubConversation, type GitHubConversationTools } from './agent.ts'
 import {
   createGitHubNotificationsQuery,
@@ -38,7 +38,24 @@ import { openLarkMemory } from './lark-memory.ts'
 import { createLarkMergeFlow } from './lark-merge.ts'
 import { openLarkMergeStore } from './lark-merge-store.ts'
 import { normalizeLarkQuote, type GetLarkQuote } from './lark-quote.ts'
+import { closeLarkChannel, createLarkSdkOptions } from './lark-sdk.ts'
 import { createPullRequestReview, type PullRequestReviewReport } from './pull-request-review.ts'
+
+class BotStartupError extends Error {
+  readonly stage: 'configuration' | 'lark' | 'webhook'
+  readonly code: string
+
+  constructor(stage: BotStartupError['stage'], code: string, message: string) {
+    super(message)
+    this.stage = stage
+    this.code = code
+  }
+}
+
+const configurationError = (message: string) =>
+  new BotStartupError('configuration', 'invalid_configuration', message)
+
+const webhookStartupCodes = new Set(['EADDRINUSE', 'EACCES', 'EPERM', 'EADDRNOTAVAIL'])
 
 async function main() {
   const appId = process.env.LARK_APP_ID?.trim()
@@ -54,6 +71,9 @@ async function main() {
     .filter(Boolean)
   const starsEnabled = Boolean(starRepoSource || starRepositories.length)
   const starPollSeconds = Number(process.env.GH_STAR_POLL_SECONDS?.trim() || 300)
+  const starWebhookSetting = process.env.GH_STAR_WEBHOOK?.trim() || undefined
+  const starWebhookEnabled =
+    starWebhookSetting === '1' || (!starsEnabled && starWebhookSetting !== '0')
   const webhookSecret = process.env.GH_WEBHOOK_SECRET?.trim()
   const webhookRepository = process.env.GH_WEBHOOK_REPOSITORY?.trim()
   const webhookPort = Number(process.env.GH_WEBHOOK_PORT?.trim() || 8787)
@@ -64,31 +84,40 @@ async function main() {
   const merger = createPullRequestMerger()
 
   if (!appId || !appSecret)
-    throw new Error('Set LARK_APP_ID and LARK_APP_SECRET in the local environment.')
+    throw configurationError('Set LARK_APP_ID and LARK_APP_SECRET in the local environment.')
   if (ownerOpenId && !ownerOpenId.startsWith('ou_')) {
-    throw new Error('LARK_OWNER_OPEN_ID must be the open_id for this Lark app.')
+    throw configurationError('LARK_OWNER_OPEN_ID must be the open_id for this Lark app.')
   }
   if (testGroupId && (!testGroupId.startsWith('oc_') || !ownerOpenId)) {
-    throw new Error('Set LARK_TEST_GROUP_CHAT_ID to a group chat_id and set LARK_OWNER_OPEN_ID.')
+    throw configurationError(
+      'Set LARK_TEST_GROUP_CHAT_ID to a group chat_id and set LARK_OWNER_OPEN_ID.',
+    )
   }
   if ((alertsEnabled || starsEnabled) && !ownerOpenId) {
-    throw new Error('Set LARK_OWNER_OPEN_ID to enable GitHub alerts.')
+    throw configurationError('Set LARK_OWNER_OPEN_ID to enable GitHub alerts.')
   }
   if (
     starRepoSource !== undefined &&
     starRepoSource !== 'watched' &&
     starRepoSource !== 'accessible'
   ) {
-    throw new Error('GH_STAR_REPO_SOURCE must be watched or accessible.')
+    throw configurationError('GH_STAR_REPO_SOURCE must be watched or accessible.')
   }
   if (starRepositories.some((repository) => !isRepositoryName(repository))) {
-    throw new Error('GH_STAR_REPOSITORIES must contain comma-separated owner/repo names.')
+    throw configurationError('GH_STAR_REPOSITORIES must contain comma-separated owner/repo names.')
   }
   if (
     starsEnabled &&
     (!Number.isInteger(starPollSeconds) || starPollSeconds < 60 || starPollSeconds > 86400)
   ) {
-    throw new Error('GH_STAR_POLL_SECONDS must be a whole number between 60 and 86400.')
+    throw configurationError('GH_STAR_POLL_SECONDS must be a whole number between 60 and 86400.')
+  }
+  if (
+    starWebhookSetting !== undefined &&
+    starWebhookSetting !== '0' &&
+    starWebhookSetting !== '1'
+  ) {
+    throw configurationError('GH_STAR_WEBHOOK must be 0 or 1.')
   }
   if (webhookSecret || webhookRepository) {
     if (
@@ -97,19 +126,21 @@ async function main() {
       !webhookRepository ||
       !isRepositoryName(webhookRepository)
     ) {
-      throw new Error(
+      throw configurationError(
         'GitHub Webhooks require LARK_GITHUB_ALERTS=1, GH_WEBHOOK_SECRET, and GH_WEBHOOK_REPOSITORY as owner/repo.',
       )
     }
     if (!Number.isInteger(webhookPort) || webhookPort < 1 || webhookPort > 65535) {
-      throw new Error('GH_WEBHOOK_PORT must be a whole TCP port between 1 and 65535.')
+      throw configurationError('GH_WEBHOOK_PORT must be a whole TCP port between 1 and 65535.')
     }
   }
   if (
     alertsEnabled &&
     (!Number.isInteger(ciPollSeconds) || ciPollSeconds < 30 || ciPollSeconds > 86400)
   ) {
-    throw new Error('GH_ACTIVITY_POLL_SECONDS must be a whole number between 30 and 86400.')
+    throw configurationError(
+      'GH_ACTIVITY_POLL_SECONDS must be a whole number between 30 and 86400.',
+    )
   }
   if (
     ownerOpenId &&
@@ -118,7 +149,7 @@ async function main() {
       !configuredChecksQuery ||
       !configuredReviewsQuery)
   ) {
-    throw new Error('Set GH_TOKEN or GH_ORG_TOKEN to enable PR queries.')
+    throw configurationError('Set GH_TOKEN or GH_ORG_TOKEN to enable PR queries.')
   }
 
   const shutdown = new AbortController()
@@ -135,7 +166,7 @@ async function main() {
     preview: createPullRequestPreviewQuery(),
     signal: shutdown.signal,
   })
-  let activeReview: Promise<PullRequestReviewReport> | undefined
+  let activeReview: Promise<void> | undefined
   const stateDir =
     process.env.LARK_MEMORY_DIR?.trim() || join(homedir(), '.local', 'state', 'github-activity-bot')
   const queryCi = alertsEnabled ? createPullRequestActivityQuery() : undefined
@@ -147,7 +178,7 @@ async function main() {
       })
     : undefined
   if (starsEnabled && !queryStars) {
-    throw new Error('Set GH_TOKEN or GH_ORG_TOKEN to enable Star polling.')
+    throw configurationError('Set GH_TOKEN or GH_ORG_TOKEN to enable Star polling.')
   }
   const memory = ownerOpenId ? openLarkMemory(stateDir, { appId, ownerOpenId }) : undefined
   const logSession = (
@@ -182,12 +213,18 @@ async function main() {
   })
   const publicRepository = createPublicRepositoryQuery()
   const groupConversations = createLarkConversations(async (scope) => {
-    const access = trackGroupGitHubAccess(github, publicRepository, memory && { scope, memory })
     return openRememberedConversation(
       scope,
       memory,
       async (resume) => {
+        const access = trackGroupGitHubAccess(github, publicRepository, memory && { scope, memory })
         const conversation = await openSession(access.tools, 'GitHub Bot · 群话题', resume)
+        try {
+          access.bindSession(conversation.id)
+        } catch (error) {
+          await conversation.close().catch(() => undefined)
+          throw error
+        }
         return {
           id: conversation.id,
           answer: async (question: string) => {
@@ -239,7 +276,7 @@ async function main() {
     appSecret,
     domain: Domain.Lark,
     transport: 'websocket',
-    loggerLevel: LoggerLevel.error,
+    ...createLarkSdkOptions({ signal: shutdown.signal }),
     policy: {
       ...(ownerOpenId ? { dmMode: 'allowlist', dmAllowlist: [ownerOpenId] } : { dmMode: 'open' }),
       ...(testGroupId ? { groupAllowlist: [testGroupId], requireMention: false } : {}),
@@ -374,111 +411,139 @@ async function main() {
     let stopProgress: ReturnType<typeof startLarkProgress> | undefined
     let source: 'merge' | 'review' | undefined
     let reviewImages: PullRequestReviewReport['images'] = []
-    const text = await answerLarkMessage(message, {
-      ownerOpenId,
-      query,
-      run: conversations.run,
-      sessionCommand: (command, chatId) =>
-        manageSession(command, `dm:${chatId}`, (requestReset) =>
-          conversations.reset(chatId, requestReset),
-        ),
-      getQuote: getPrivateQuote,
-      merge: mergeFlow && ((message, intent) => trackMerge(mergeFlow.answerDm(message, intent))),
-      review: async (request) => {
-        if (activeReview) return '上一条 PR 评审还在处理，请稍后再试。'
-        const job = reviewPullRequest(request)
-        activeReview = job
-        try {
-          const report = await job
-          reviewImages = report.images
-          return redact(report.text)
-        } finally {
-          activeReview = undefined
-        }
-      },
-      onUnconfiguredOwner: (openId) => console.log(`Received DM from open_id: ${openId}`),
-      onEvent: (entry) => {
-        if (entry.event === 'received') {
-          source = entry.source
-          log(entry.event, source ? { source, action: entry.text } : { text: redact(entry.text) })
-          stopProgress = startLarkProgress({
-            show: () => channel.addReaction(message.messageId, 'OnIt'),
-            hide: (reactionId) => channel.removeReaction(message.messageId, reactionId),
-            acknowledge: async () => {
-              if (shutdown.signal.aborted) return
-              await channel.send(
-                message.chatId,
-                { text: '收到，正在处理…' },
-                { replyTo: message.messageId },
-              )
-            },
-            onError: (operation) => log('progress_failed', { operation }),
-          })
-          return
-        }
-        const diagnostic =
-          entry.source === 'codex'
-            ? entry.error instanceof CodexAnswerError
-              ? entry.error.diagnostic
-              : { code: 'unexpected_error' }
-            : {}
-        log(entry.event, { source: entry.source, ...diagnostic, durationMs: durationMs() })
-      },
-    })
-    if (text === undefined) return
-    const cleanup = stopProgress?.()
-    const reply = source ? { source } : { text: redact(text) }
+    let reviewCompletion: PromiseWithResolvers<void> | undefined
+    let cleanup: Promise<void> | undefined
+    let reply: Record<string, string> = {}
     try {
+      const text = await answerLarkMessage(message, {
+        ownerOpenId,
+        query,
+        run: conversations.run,
+        sessionCommand: (command, chatId) =>
+          manageSession(command, `dm:${chatId}`, (requestReset) =>
+            conversations.reset(chatId, requestReset),
+          ),
+        getQuote: getPrivateQuote,
+        merge: mergeFlow && ((message, intent) => trackMerge(mergeFlow.answerDm(message, intent))),
+        review: async (request) => {
+          if (activeReview) return '上一条 PR 评审还在处理，请稍后再试。'
+          reviewCompletion = Promise.withResolvers<void>()
+          activeReview = reviewCompletion.promise
+          const report = await reviewPullRequest(request)
+          reviewImages = report.images
+          return report.text
+        },
+        onUnconfiguredOwner: (openId) => console.log(`Received DM from open_id: ${openId}`),
+        onEvent: (entry) => {
+          if (entry.event === 'received') {
+            source = entry.source
+            log(entry.event, source ? { source, action: entry.text } : { text: redact(entry.text) })
+            stopProgress = startLarkProgress({
+              show: () => channel.addReaction(message.messageId, 'OnIt'),
+              hide: (reactionId) => channel.removeReaction(message.messageId, reactionId),
+              acknowledge: async () => {
+                if (shutdown.signal.aborted) return
+                await channel.send(
+                  message.chatId,
+                  { text: '收到，正在处理…' },
+                  { replyTo: message.messageId },
+                )
+              },
+              onError: (operation) => log('progress_failed', { operation }),
+            })
+            return
+          }
+          const diagnostic =
+            entry.source === 'codex'
+              ? entry.error instanceof CodexAnswerError
+                ? entry.error.diagnostic
+                : { code: 'unexpected_error' }
+              : {}
+          log(entry.event, { source: entry.source, ...diagnostic, durationMs: durationMs() })
+        },
+      })
+      if (text === undefined) return
+      cleanup = stopProgress?.()
+      const safeText = redact(text)
+      reply = source ? { source } : { text: safeText }
       if (shutdown.signal.aborted) {
         log('reply_skipped', { reason: 'shutdown', durationMs: durationMs() })
         return
       }
-      await channel.send(message.chatId, { text }, { replyTo: message.messageId })
+      const summary = await channel.send(
+        message.chatId,
+        { text: safeText },
+        { replyTo: message.messageId },
+      )
       log('reply_sent', { ...reply, durationMs: durationMs() })
       const missingImages: string[] = []
       for (const [index, { label, png }] of reviewImages.entries()) {
         if (shutdown.signal.aborted) break
         try {
-          await channel.send(ownerOpenId, { image: { source: png } })
+          await channel.send(
+            message.chatId,
+            { image: { source: png } },
+            { replyTo: summary.messageId },
+          )
         } catch {
           missingImages.push(`图 ${index + 1} · ${label}`)
         }
       }
       if (missingImages.length && !shutdown.signal.aborted) {
         log('review_images_failed', { count: missingImages.length })
-        await channel.send(ownerOpenId, {
-          text: `这些截图发送失败。请检查 Lark 应用的图片上传权限。\n${missingImages.join('\n')}`,
-        })
+        await channel.send(
+          message.chatId,
+          { text: `这些截图发送失败。可以重新发起评审。\n${missingImages.join('\n')}` },
+          { replyTo: summary.messageId },
+        )
       }
     } catch (error) {
       const code = error instanceof LarkChannelError ? error.code : 'unknown'
       log('reply_failed', { ...reply, code, durationMs: durationMs() })
     } finally {
-      await cleanup
+      if (reviewCompletion) {
+        activeReview = undefined
+        reviewCompletion.resolve()
+      }
+      await (cleanup ?? stopProgress?.())
     }
   })
   channel.on('error', () => console.error('Lark could not process an incoming event.'))
 
-  let starting = 'Lark'
+  let starting: 'lark' | 'webhook' = 'lark'
   try {
     await channel.connect()
     if (webhook) {
-      starting = 'GitHub Webhook'
+      starting = 'webhook'
       await webhook.listen({ host: '127.0.0.1', port: webhookPort })
       console.log(`GitHub Webhook listening on 127.0.0.1:${webhookPort}/webhooks/github.`)
     }
   } catch (error) {
-    await Promise.allSettled([channel.disconnect(), webhook?.close()])
+    shutdown.abort()
+    await Promise.allSettled([
+      closeLarkChannel(channel),
+      conversations.close(),
+      groupConversations.close(),
+      webhook?.close(),
+      activeReview,
+      ...pendingMerges,
+    ])
     alertStore?.close()
     mergeStore?.close()
     memory?.close()
-    const code =
-      error instanceof LarkChannelError
-        ? error.code
-        : error instanceof Error && 'code' in error && typeof error.code === 'string'
-          ? error.code
-          : 'unknown'
-    throw new Error(`Could not start ${starting} (${code}).`)
+    let code = 'unknown'
+    if (starting === 'lark' && error instanceof LarkChannelError) code = error.code
+    if (
+      starting === 'webhook' &&
+      error instanceof Error &&
+      'code' in error &&
+      typeof error.code === 'string' &&
+      webhookStartupCodes.has(error.code)
+    ) {
+      code = error.code
+    }
+    const component = starting === 'lark' ? 'Lark' : 'GitHub Webhook'
+    throw new BotStartupError(starting, code, `Could not start ${component} (${code}).`)
   }
 
   console.log('Connected to Lark via WebSocket.')
@@ -497,6 +562,7 @@ async function main() {
       queryInbox,
       queryStars,
       webhookRepository,
+      starWebhookEnabled,
       send: createLarkAlertSender(channel.rawClient.im.v1.message, redact),
       signal: shutdown.signal,
       ciIntervalMs: ciPollSeconds * 1_000,
@@ -516,7 +582,7 @@ async function main() {
     void Promise.allSettled([
       conversations.close(),
       groupConversations.close(),
-      channel.disconnect(),
+      closeLarkChannel(channel),
       webhook?.close(),
       alertWorker,
       activeReview,
@@ -542,6 +608,10 @@ async function main() {
 try {
   await main()
 } catch (error) {
-  console.error(error instanceof Error ? error.message : String(error))
+  const diagnostic = error instanceof BotStartupError ? error : undefined
+  console.log(
+    `github-activity-bot startup_failed ${diagnostic?.stage ?? 'bot'} ${diagnostic?.code ?? 'unknown'}`,
+  )
+  console.error(diagnostic?.message ?? 'GitHub Activity Bot could not start.')
   process.exitCode = 1
 }

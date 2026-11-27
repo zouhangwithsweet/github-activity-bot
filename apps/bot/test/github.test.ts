@@ -147,6 +147,7 @@ await test('reads a merged PR with org credentials and skips file requests for m
       variables: unknown
     }
     assert.match(query, /query PullRequestDetail/)
+    assert.match(query, /nameWithOwner\s+visibility/)
     assert.deepEqual(variables, { owner: 'example', repo: 'private-repo', number: 65 })
     const token = new Headers(init.headers).get('authorization')
     tokens.push(token)
@@ -155,7 +156,11 @@ await test('reads a merged PR with org credentials and skips file requests for m
     }
     return Response.json({
       data: {
-        repository: { nameWithOwner: 'example/private-repo', pullRequest: detailNode },
+        repository: {
+          nameWithOwner: 'example/private-repo',
+          visibility: 'PRIVATE',
+          pullRequest: detailNode,
+        },
       },
     })
   }
@@ -169,6 +174,7 @@ await test('reads a merged PR with org credentials and skips file requests for m
   assert.ok(pullRequest)
   assert.deepEqual(tokens, ['Bearer personal-token', 'Bearer org-token'])
   assert.equal(pullRequest.state, 'MERGED')
+  assert.equal(pullRequest.restrictedRepository, true)
   assert.equal(pullRequest.checks, null)
   assert.equal(pullRequest.reviewDecision, 'APPROVED')
   assert.equal(pullRequest.changedFiles, 17)
@@ -261,7 +267,7 @@ await test('reads paginated check runs and commit statuses for the current PR he
       return Response.json({
         number: 65,
         html_url: detailNode.url,
-        base: { repo: { full_name: 'example/private-repo' } },
+        base: { repo: { full_name: 'example/private-repo', private: true } },
         head: { sha: head },
       })
     }
@@ -308,6 +314,7 @@ await test('reads paginated check runs and commit statuses for the current PR he
   const result = await checks('example/private-repo', 65)
   assert.ok(result)
   assert.equal(result.headRefOid, firstHead)
+  assert.equal(result.restrictedRepository, true)
   assert.equal(result.coverage, 'complete')
   assert.deepEqual(result.entries, [
     {
@@ -514,20 +521,22 @@ await test('only accepts exact public repository metadata from unauthenticated G
     repos.push(url.pathname)
     if (url.pathname.endsWith('renamed')) return new Response(null, { status: 301 })
     if (url.pathname.endsWith('missing')) return new Response(null, { status: 404 })
+    if (url.pathname.endsWith('busy')) return new Response(null, { status: 429 })
     const metadata = { full_name: 'Example/Bot', visibility: 'public', private: false }
     return Response.json(
       url.pathname.endsWith('private')
-        ? { ...metadata, visibility: 'private', private: true }
+        ? { ...metadata, full_name: 'Example/Private', visibility: 'private', private: true }
         : metadata,
     )
   }
   const isPublic = createPublicRepositoryQuery(request)
   assert.equal(await isPublic('example/bot'), true)
-  assert.equal(await isPublic('example/different'), false)
+  assert.equal(await isPublic('example/different'), undefined)
   assert.equal(await isPublic('example/private'), false)
-  assert.equal(await isPublic('example/renamed'), false)
-  assert.equal(await isPublic('example/missing'), false)
-  assert.equal(await isPublic('example/..'), false)
-  assert.equal(await isPublic('example/bot?token=x'), false)
-  assert.equal(repos.length, 5)
+  assert.equal(await isPublic('example/renamed'), undefined)
+  assert.equal(await isPublic('example/missing'), undefined)
+  assert.equal(await isPublic('example/busy'), undefined)
+  assert.equal(await isPublic('example/..'), undefined)
+  assert.equal(await isPublic('example/bot?token=x'), undefined)
+  assert.equal(repos.length, 6)
 })

@@ -35,6 +35,7 @@ await test('polls Stars without CI, keeps failed repos retryable, and delivers o
     store,
     recipientOpenId: owner,
     webhookRepository: 'example/webhook',
+    starWebhookEnabled: true,
     now: () => now,
     queryStars: {
       listRepositories: async () => [
@@ -69,6 +70,82 @@ await test('polls Stars without CI, keeps failed repos retryable, and delivers o
   assert.deepEqual(reads, [repository, repository, repository])
   assert.equal(delivered.length, 1)
   assert.match(delivered[0], /净增 2/)
+})
+
+await test('polls Stars alongside CI-only webhooks and rebaselines after a Star webhook restart', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'github-star-source-'))
+  const path = join(directory, 'memory.sqlite')
+  let store = openGitHubAlertStore(path)
+  t.after(() => {
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  let now = 1_000
+  let count = 3
+  const repository = 'example/bot'
+  const sent: string[] = []
+  const worker = (starWebhookEnabled = false) =>
+    createGitHubAlertWorker({
+      store,
+      recipientOpenId: owner,
+      webhookRepository: repository,
+      starWebhookEnabled,
+      now: () => now,
+      queryStars: {
+        listRepositories: async () => [{ repository, starCount: count }],
+        readStarCount: async () => assert.fail('listed count is available'),
+      },
+      async send(alert) {
+        sent.push(alert.text)
+        return { kind: 'sent' }
+      },
+    })
+  const receipt = (id: string) =>
+    store.receiveWebhook(
+      id,
+      { kind: 'star', action: 'created', repository, url: 'https://github.com/example/bot' },
+      now,
+    )
+
+  const original = worker()
+  await original.pollStars()
+  now += 1
+  count += 1
+  receipt('previous-poll-source')
+  await original.pollStars()
+  await original.deliver()
+  assert.equal(sent.length, 1)
+  assert.match(sent[0], /净增 1/)
+
+  store.close()
+  store = openGitHubAlertStore(path)
+  const perStar = worker(true)
+  await perStar.processWebhooks()
+  now += 1
+  count += 1
+  receipt('new-webhook-source')
+  await perStar.pollStars()
+  await perStar.processWebhooks()
+  await perStar.deliver()
+  assert.equal(sent.length, 2)
+  assert.equal(sent[1], 'GitHub Star · example/bot\nhttps://github.com/example/bot')
+
+  store.close()
+  store = openGitHubAlertStore(path)
+  const resumedPoll = worker()
+  now += 1
+  await resumedPoll.pollStars()
+  await resumedPoll.deliver()
+  assert.equal(sent.length, 2)
+  now += 1
+  count += 1
+  receipt('poll-source-again')
+  await resumedPoll.processWebhooks()
+  await resumedPoll.pollStars()
+  await resumedPoll.deliver()
+  await resumedPoll.deliver()
+  assert.equal(sent.length, 3)
+  assert.match(sent[2], /净增 1 · 当前 6/)
 })
 
 await test('reopens a signed delivery and shares one current-head CI transition with polling', async (t) => {

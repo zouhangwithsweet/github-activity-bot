@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { and, desc, eq, sql } from 'drizzle-orm'
+import { and, desc, eq, isNotNull, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/node-sqlite'
 import {
   groupAnchors,
@@ -116,6 +116,34 @@ export function openLarkMemory(stateDir: string, identity: { appId: string; owne
           .reverse()
           .map(({ threadId, ...anchor }) => (threadId ? { ...anchor, threadId } : anchor))
       },
+      getGroupAnchor(chatId: string, key: string): LarkGroupAnchor | undefined {
+        const anchor = db
+          .select({
+            key: groupAnchors.key,
+            sessionKey: groupAnchors.sessionKey,
+            threadId: groupAnchors.threadId,
+          })
+          .from(groupAnchors)
+          .where(and(eq(groupAnchors.chatId, chatId), eq(groupAnchors.key, key)))
+          .get()
+        if (!anchor) return
+
+        const threadId =
+          anchor.threadId ??
+          db
+            .select({ threadId: groupAnchors.threadId })
+            .from(groupAnchors)
+            .where(
+              and(
+                eq(groupAnchors.chatId, chatId),
+                eq(groupAnchors.sessionKey, anchor.sessionKey),
+                isNotNull(groupAnchors.threadId),
+              ),
+            )
+            .orderBy(desc(groupAnchors.sequence))
+            .get()?.threadId
+        return { key, sessionKey: anchor.sessionKey, threadId: threadId ?? undefined }
+      },
       saveGroupAnchor(chatId: string, anchor: LarkGroupAnchor) {
         const { key, sessionKey, threadId = null } = anchor
         db.insert(groupAnchors)
@@ -126,32 +154,37 @@ export function openLarkMemory(stateDir: string, identity: { appId: string; owne
           })
           .run()
       },
-      getGroupRepositories(scope: string): string[] {
+      getGroupRepositories(scope: string, nativeId: string): string[] {
         return db
           .select({ repository: groupRepositories.repository })
           .from(groupRepositories)
-          .where(eq(groupRepositories.scope, scope))
+          .where(and(eq(groupRepositories.scope, scope), eq(groupRepositories.nativeId, nativeId)))
           .orderBy(groupRepositories.repository)
           .all()
           .map(({ repository }) => repository)
       },
-      rememberGroupRepository(scope: string, repository: string) {
+      rememberGroupRepository(scope: string, nativeId: string, repository: string) {
         db.insert(groupRepositories)
-          .values({ scope, repository: repository.toLowerCase() })
+          .values({ scope, nativeId, repository: repository.toLowerCase() })
           .onConflictDoNothing()
           .run()
       },
-      isGroupPrivate(scope: string): boolean {
+      isGroupPrivate(scope: string, nativeId: string): boolean {
         return Boolean(
           db
             .select({ scope: privateGroupSessions.scope })
             .from(privateGroupSessions)
-            .where(eq(privateGroupSessions.scope, scope))
+            .where(
+              and(
+                eq(privateGroupSessions.scope, scope),
+                eq(privateGroupSessions.nativeId, nativeId),
+              ),
+            )
             .get(),
         )
       },
-      markGroupPrivate(scope: string) {
-        db.insert(privateGroupSessions).values({ scope }).onConflictDoNothing().run()
+      markGroupPrivate(scope: string, nativeId: string) {
+        db.insert(privateGroupSessions).values({ scope, nativeId }).onConflictDoNothing().run()
       },
       close() {
         if (database.isOpen) database.close()

@@ -8,11 +8,11 @@
 flowchart TB
     DM["Lark CLI · 私聊"]
     GROUP["Lark 测试群<br/>主聊天 @ Bot · 话题追问"]
-    MYGO["MyGo macOS 菜单栏 · apps/desktop<br/>状态 · 暂停/继续 · 设置 · 错误"]
+    MYGO["MyGo macOS 菜单栏 · apps/desktop<br/>当前提交 · 启动期限 · 分类错误"]
     KEYCHAIN["macOS 钥匙串<br/>保存已配置机密"]
 
     subgraph Host["本机 GitHub Agent 服务 · apps/bot"]
-      CHANNEL["Lark 适配器<br/>识别请求者 · 同聊引用 · 回复原处"]
+      CHANNEL["Lark 适配器<br/>同聊引用 · 请求超时 · 日志脱敏"]
       SESSION["会话与任务调度<br/>按私聊或群话题排队 · 查询与重置"]
       MERGE["单 PR 合并<br/>本人私聊 · 预览后确认"]
       OAR["OAR 会话接口"]
@@ -21,7 +21,7 @@ flowchart TB
       TOOLS["GitHub 查询与工具<br/>PR · CI · 评论 · review"]
       PR_REVIEW["PR 改动评审<br/>当前提交 · 路由识别 · 官网点评"]
       CAPTURE["隔离 Chromium<br/>桌面和手机 PNG"]
-      MEMORY["Drizzle 会话记忆<br/>TypeScript 表结构 · 启动迁移"]
+      MEMORY["Drizzle 会话记忆<br/>话题锚点 · 按 Codex 会话隔离可见性"]
       STORE[("本机 memory.sqlite<br/>会话 · PR 状态 · 收件与待发送记录")]
       MERGE_STORE[("同一应用和账号目录的 merge.sqlite<br/>合并确认 · 执行结果")]
       HTTP["Fastify Webhook · 本机回环<br/>原始请求体验签"]
@@ -42,7 +42,7 @@ flowchart TB
     PR_REVIEW -->|"获取 diff 和当前提交的 Vercel 部署"| TOOLS
     PR_REVIEW -->|"截图指定路由"| CAPTURE
     PR_REVIEW -->|"截图和 diff 送入独立会话"| OAR
-    PR_REVIEW -->|"私聊文字与图片"| CHANNEL
+    PR_REVIEW -->|"私聊摘要 · 截图引用摘要"| CHANNEL
     CHANNEL <-->|"本人私聊预览与确认 / 群请求转私聊预览"| MERGE
     MERGE <-->|"保存并单次领取确认"| MERGE_STORE
     MERGE -->|"复核分支与 head SHA 后单次 REST 合并"| GITHUB
@@ -75,7 +75,7 @@ flowchart TB
 | [apps/desktop](../apps/desktop) | MyGo 菜单栏、设置、macOS 钥匙串与 Bot 进程管理 |
 | [仓库根目录](../package.json) | pnpm 工作区入口，提供 `pnpm lark`、`pnpm prs` 与 `pnpm desktop:build` |
 
-MyGo 和 CLI 都以仓库根目录为 Bot 的工作目录。桌面端优先启动 `apps/bot/src/lark.ts`，旧布局回退到 `src/lark.ts`。桌面设置和钥匙串中的非空值优先，其次为继承的环境变量，再读取根目录 `.env`。暂停会通知 Bot 退出，恢复会重新启动并连接 Lark。重启会等待旧进程退出。[桌面进程管理](../apps/desktop/controller.go) · [配置与凭据](../apps/desktop/internal/settings/settings.go)
+MyGo 和 CLI 都以仓库根目录为 Bot 的工作目录。桌面端优先启动 `apps/bot/src/lark.ts`，旧布局回退到 `src/lark.ts`。桌面设置和钥匙串中的非空值优先，其次为继承的环境变量，再读取根目录 `.env`。暂停会通知 Bot 退出，恢复会重新启动并连接 Lark。重启会等待旧进程退出。菜单栏显示启动时的 Git 提交，启动失败时只展示已分类的错误。飞书 HTTP 请求有期限，SDK 日志只记录允许的诊断字段。[桌面进程管理](../apps/desktop/controller.go) · [配置与凭据](../apps/desktop/internal/settings/settings.go) · [飞书网络和日志](../apps/bot/src/lark-sdk.ts)
 
 ## Lark 对话与投递
 
@@ -91,11 +91,11 @@ MyGo 和 CLI 都以仓库根目录为 Bot 的工作目录。桌面端优先启�
 
 Lark 适配器核对绑定账号、群聊范围和回复位置，使用消息 ID 读取同聊引用。引用内容作为上下文，操作意图来自本人消息。群聊和私聊分别排队与恢复会话。群聊原处接收普通问答和已确认公开的仓库查询结果。私有仓库、可见性未知和个人 PR 列表在群里提示改用私聊查询。[私聊路由](../apps/bot/src/lark-handler.ts) · [群聊路由](../apps/bot/src/lark-group.ts) · [群结果投递](../apps/bot/src/lark-group-work.ts)
 
-每个私聊或群话题复用各自的 Codex 会话。成功打开后即写入会话 ID。超时后重试沿用同一 ID，群话题空闲 30 分钟后释放进程并保留 ID。原会话确认丢失或已归档时进行替换。手动重置只作用于当前范围，等下一次普通问答才开启新会话，并保留旧 Codex 历史和群聊可见性记录。[会话生命周期](../apps/bot/src/lark-handler.ts) · [会话存储](../apps/bot/src/lark-memory.ts)
+每个私聊或群话题复用各自的 Codex 会话。成功打开后即写入会话 ID。超时后重试优先沿用同一 ID，群话题空闲 30 分钟后释放进程并保留 ID。原会话确认丢失或已归档时进行替换。手动重置只作用于当前范围，等下一次普通问答才开启新会话。确认受限的结果标记跟随原 Codex 会话，暂时查不到可见性时，下一轮仍可重新核验。缓存中的话题锚点淘汰后可以从 SQLite 重新加载。[会话生命周期](../apps/bot/src/lark-handler.ts) · [会话存储](../apps/bot/src/lark-memory.ts)
 
 OAR 为 Codex 注入 `list_my_open_prs`、`get_pull_request`、`list_pr_checks` 和 `get_pull_request_reviews` 四个只读 MCP 工具。查询凭据留在宿主，Codex 启动时移除继承的凭据环境变量。[OAR 与 MCP](../apps/bot/src/agent.ts) · [GitHub 查询](../apps/bot/src/github.ts)
 
-PR 评审从 GitHub 部署记录选取当前 head 的成功 Vercel 预览，在隔离浏览器以两个尺寸截图。独立 Codex 会话分析 diff 和图片。发送前再次核对 PR 的 head。截图只发绑定账号，临时文件在评审后清理。[评审流程](../apps/bot/src/pull-request-review.ts) · [预览截图](../apps/bot/src/preview-capture.ts)
+PR 评审从 GitHub 部署记录选取当前 head 的成功 Vercel 预览，在隔离浏览器以两个尺寸截图。独立 Codex 会话分析 diff 和图片。发送前再次核对 PR 的 head。截图引用对应摘要发送到绑定账号的私聊，图片投递结束后才接受下一次评审。临时文件在评审后清理。[评审流程](../apps/bot/src/pull-request-review.ts) · [预览截图](../apps/bot/src/preview-capture.ts)
 
 ## 单个 PR 合并
 
@@ -110,11 +110,11 @@ PR 评审从 GitHub 部署记录选取当前 head 的成功 Vercel 预览，在�
 | 来源 | 覆盖与投递 |
 | --- | --- |
 | CI 轮询 | 关注本人发起、显式跟踪和个人通知发现的 PR，首次建立基线。状态变化时以当前 head SHA 为准。 |
-| 个人通知 | 配置通知凭据后轮询近期相关线程，按 GitHub 返回的间隔处理，覆盖评审请求、提及和评论等。 |
-| Star 轮询 | 可以选当前账号 Watch 的仓库、凭据可列出的仓库或指定名单。首次读取建立基线。总数增长时，在私聊按仓库发净增量和当前总数。 |
+| 个人通知 | 首次从最新一页建立基线，之后按 GitHub 返回的间隔扫描增量。所有分页读取完成后才推进游标。覆盖评审请求、提及和评论等。 |
+| Star 轮询 | 可以选当前账号 Watch 的仓库、凭据可列出的仓库或指定名单。首次读取建立基线，总数增长时在私聊发净增量和当前总数。同时使用 Webhook 时，可用 `GH_STAR_WEBHOOK=1` 将 Webhook 仓库切换为逐条推送。 |
 | GitHub App Webhook | 一个已配置仓库。现有 HTTPS 代理转发到本机回环 Fastify。原始请求体验签后，按 delivery ID 写入收件记录。star、fork 可直接入队，PR 和 CI 事件触发只读刷新。 |
 
-CI、私聊通知和 Webhook 用 `LARK_GITHUB_ALERTS=1` 启用。Star 轮询由仓库范围配置启用。状态变更和待发送记录在同一个 SQLite 事务里写入。发送器使用稳定的投递 UUID，重启后继续处理明确待发的记录，暂时无法判断发送结果的记录保留供核对。[Webhook 接入](../apps/bot/src/github-webhook.ts) · [Star 查询](../apps/bot/src/github-stars.ts) · [提醒后台](../apps/bot/src/github-alert-worker.ts) · [状态和去重](../apps/bot/src/github-alert-store.ts)
+CI、私聊通知和 Webhook 用 `LARK_GITHUB_ALERTS=1` 启用。Star 轮询由仓库范围配置启用。状态变更和待发送记录在同一个 SQLite 事务里写入。发送器使用稳定的投递 UUID，重启后继续处理明确待发的记录。请求超时且发送结果无法确认时保留记录供核对，随后继续处理其余提醒。[Webhook 接入](../apps/bot/src/github-webhook.ts) · [Star 查询](../apps/bot/src/github-stars.ts) · [提醒后台](../apps/bot/src/github-alert-worker.ts) · [状态和去重](../apps/bot/src/github-alert-store.ts)
 
 ## 本地数据
 

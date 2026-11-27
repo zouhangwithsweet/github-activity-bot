@@ -250,7 +250,7 @@ await test('redirects group confirmations to DM without passing a confirmation c
   assert.deepEqual(replies, ['请在 Bot 私聊里确认合并。'])
 })
 
-await test('keeps group results private once tool history includes an unverified repository or owner data', async () => {
+await test('keeps group results private once tool history includes a restricted repository or owner data', async () => {
   const github = {
     list: async () => ({ login: 'owner', unavailableRepositories: [], pullRequests: [] }),
     detail: async () => null,
@@ -273,4 +273,35 @@ await test('keeps group results private once tool history includes an unverified
   assert.equal(await next.canReplyInGroup(), true)
   await next.tools.list()
   assert.equal(await next.canReplyInGroup(), false)
+})
+
+await test('recovers from indeterminate visibility and protects confirmed restricted tool history', async () => {
+  let offline = true
+  const group = trackGroupGitHubAccess(
+    {
+      list: async () => assert.fail('unexpected GitHub query'),
+      detail: async () => null,
+      reviews: async () => null,
+      checks: async (repository, number) => ({
+        repository,
+        restrictedRepository: true,
+        number,
+        url: 'https://github.com/acme/project/pull/42',
+        headRefOid: '1'.repeat(40),
+        coverage: 'complete',
+        sources: { checkRuns: 'complete', commitStatuses: 'complete' },
+        entries: [],
+      }),
+    },
+    async () => {
+      if (offline) throw new Error('temporary failure')
+      return true
+    },
+  )
+  await group.tools.detail('acme/public', 1)
+  assert.equal(await group.canReplyInGroup(), false)
+  offline = false
+  assert.equal(await group.canReplyInGroup(), true)
+  await group.tools.checks('acme/project', 42)
+  assert.equal(await group.canReplyInGroup(), false)
 })

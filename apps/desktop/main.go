@@ -128,6 +128,9 @@ func (a *desktopApp) refreshTray() {
 		view.state, view.canStop = "正在连接飞书…", true
 	case bot.Running:
 		view.state, view.canStop = "Bot 运行中", true
+		if snapshot.Revision != "" {
+			view.state += " · " + snapshot.Revision
+		}
 	case bot.Stopping:
 		view.state = "正在停止 Bot…"
 	case bot.Failed:

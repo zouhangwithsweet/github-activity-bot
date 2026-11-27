@@ -40,7 +40,7 @@ const inferredQuestion =
 export function createLarkGroupRouter(options: {
   ownerOpenId: string
   allowedChatIds: Iterable<string>
-  memory?: Pick<LarkMemory, 'getGroupAnchors' | 'saveGroupAnchor'>
+  memory?: Pick<LarkMemory, 'getGroupAnchor' | 'getGroupAnchors' | 'saveGroupAnchor'>
 }) {
   const allowedChats = new Set(options.allowedChatIds)
   const anchors = new Map<string, GroupTopic>()
@@ -54,6 +54,12 @@ export function createLarkGroupRouter(options: {
       const oldest = anchors.keys().next()
       if (!oldest.done) anchors.delete(oldest.value)
     }
+  }
+
+  function findAnchor(chatId: string, key: string) {
+    const topic = anchors.get(key) ?? options.memory?.getGroupAnchor(chatId, key)
+    if (topic) remember(key, topic)
+    return topic
   }
 
   function saveAnchor(chatId: string, key: string, topic: GroupTopic) {
@@ -92,13 +98,15 @@ export function createLarkGroupRouter(options: {
       const inferIntent = !authoredNote && mentionedBot && Boolean(replyToMessageId)
       if (!authoredNote && !mentionedBot) return
       const findMessage = (id: string | undefined) => {
-        const found = id ? anchors.get(anchorKey(chatId, 'message', id)) : undefined
+        const found = id ? findAnchor(chatId, anchorKey(chatId, 'message', id)) : undefined
         if (found?.threadId && threadId && found.threadId !== threadId) return
         return found
       }
 
       const parent = findMessage(replyToMessageId)
-      const thread = threadId ? anchors.get(anchorKey(chatId, 'thread', threadId)) : undefined
+      const thread = threadId
+        ? findAnchor(chatId, anchorKey(chatId, 'thread', threadId))
+        : undefined
       const existingTopic = thread ?? parent ?? findMessage(rootId)
       if (!existingTopic && !mentionedBot) return
 
@@ -114,14 +122,13 @@ export function createLarkGroupRouter(options: {
         mentionedBot,
         threadId,
         replyToMessageId,
-        // Authored follow-ups can use session history. A bare mention needs the actual quote.
-        quotedMessageId:
-          replyToMessageId && (inferIntent || parent !== topic) ? replyToMessageId : undefined,
+        // Topic anchors survive native history replacement, so resolve every explicit quote.
+        quotedMessageId: replyToMessageId,
         inferIntent: inferIntent || undefined,
       }
     },
     recordReply(turn: LarkGroupTurn, replyMessageId: string, threadId?: string) {
-      const topic = anchors.get(anchorKey(turn.chatId, 'message', turn.messageId))
+      const topic = findAnchor(turn.chatId, anchorKey(turn.chatId, 'message', turn.messageId))
       if (topic?.sessionKey !== turn.sessionKey) return
       saveAnchor(turn.chatId, anchorKey(turn.chatId, 'message', replyMessageId), topic)
       if (threadId && (!topic.threadId || topic.threadId === threadId)) {

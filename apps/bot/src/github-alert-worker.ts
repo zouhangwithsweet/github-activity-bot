@@ -32,6 +32,7 @@ interface AlertWorkerOptions {
   queryInbox?: GitHubNotificationsQuery
   queryStars?: GitHubStarQueries
   webhookRepository?: string
+  starWebhookEnabled?: boolean
   send: (alert: AlertToDeliver) => Promise<AlertDelivery>
   now?: () => number
   report?: (stage: string, fields: Record<string, number | string>) => void
@@ -56,11 +57,15 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
     queryInbox,
     queryStars,
     webhookRepository,
+    starWebhookEnabled = !queryStars,
     send,
     report,
   } = options
   const now = options.now ?? Date.now
+  const starWebhookRepository = starWebhookEnabled ? webhookRepository?.toLowerCase() : undefined
+  store.configureStarWebhook(webhookRepository, starWebhookEnabled, now())
   let login: string | undefined
+  let ciRetryAt = 0
   let ciQueue = Promise.resolve()
 
   function refreshCi(events?: readonly GitHubWebhookEvent[]) {
@@ -68,7 +73,19 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
     if (!query) return
     const refresh = ciQueue.then(async () => {
       const startedAt = now()
-      const result = await query(store.getInboxTrackedPullRequests())
+      if (startedAt < ciRetryAt) {
+        throw new GitHubActivityPollError(
+          'GitHub pull request polling was rate-limited.',
+          ciRetryAt - startedAt,
+        )
+      }
+      const result = await query(store.getInboxTrackedPullRequests()).catch((error: unknown) => {
+        if (error instanceof GitHubActivityPollError && error.retryAfterMs !== undefined) {
+          ciRetryAt = now() + error.retryAfterMs
+        }
+        throw error
+      })
+      if (result.retryAfterMs !== undefined) ciRetryAt = now() + result.retryAfterMs
       login = result.login
       const pullRequests = events
         ? result.pullRequests.filter((pr) =>
@@ -80,7 +97,7 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
           )
         : result.pullRequests
       const observations = new Map<CiObservation, CiObservation | undefined>()
-      if (queryChecks) {
+      if (queryChecks && result.retryAfterMs === undefined) {
         const candidates = store.getCiFailureCandidates(pullRequests, startedAt)
         await Promise.all(
           candidates.slice(0, 6).map(async (item) => {
@@ -124,16 +141,21 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
 
   return {
     async pollCi() {
-      await refreshCi()
+      const result = await refreshCi()
+      if (result?.retryAfterMs !== undefined) {
+        throw new GitHubActivityPollError(
+          'GitHub pull request polling was rate-limited.',
+          result.retryAfterMs,
+        )
+      }
     },
     async pollStars(signal?: AbortSignal) {
       if (!queryStars) return
       const listedAt = now()
       const repositories = await queryStars.listRepositories(signal)
-      const delegatedRepository = webhookRepository?.toLowerCase()
       const targets = [
         ...new Map(repositories.map((entry) => [entry.repository.toLowerCase(), entry])).values(),
-      ].filter(({ repository }) => repository.toLowerCase() !== delegatedRepository)
+      ].filter(({ repository }) => repository.toLowerCase() !== starWebhookRepository)
       let observed = 0
       let unavailable = 0
       let queued = 0
@@ -198,7 +220,7 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
         throw error
       }
     },
-    async pollInbox() {
+    async pollInbox(signal?: AbortSignal) {
       if (!queryInbox || !login) return idleDeliveryMs
       const previous = store.getInboxCursor()
       const interval = Math.max(inboxIntervalMs, previous?.pollIntervalMs ?? 0)
@@ -206,7 +228,7 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
       const waitFor = (previous?.lastPollAtMs ?? startedAt - interval) + interval - startedAt
       if (waitFor > 0) return waitFor
 
-      const result = await queryInbox(login, previous)
+      const result = await queryInbox(login, previous, { signal, startedAtMs: startedAt })
       const queued = store.observeInbox(
         result.items,
         result.cursor,
@@ -299,7 +321,7 @@ export async function runGitHubAlerts(
 
   await Promise.all([
     options.queryCi ? run('ci', () => worker.pollCi(), ciIntervalMs) : undefined,
-    options.queryInbox ? run('inbox', () => worker.pollInbox(), inboxIntervalMs) : undefined,
+    options.queryInbox ? run('inbox', () => worker.pollInbox(signal), inboxIntervalMs) : undefined,
     options.queryStars
       ? run('stars', () => worker.pollStars(signal), options.starIntervalMs ?? starIntervalMs)
       : undefined,

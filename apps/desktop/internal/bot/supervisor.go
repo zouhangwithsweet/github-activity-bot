@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,32 +30,39 @@ var (
 )
 
 const (
-	readyLine          = "Connected to Lark via WebSocket."
-	defaultStopTimeout = 20 * time.Second
-	waitDelay          = 2 * time.Second
-	forceStopTimeout   = 3 * time.Second
+	readyLine             = "Connected to Lark via WebSocket."
+	startupFailurePrefix  = "github-activity-bot startup_failed "
+	defaultStartupTimeout = 60 * time.Second
+	defaultStopTimeout    = 20 * time.Second
+	waitDelay             = 2 * time.Second
+	forceStopTimeout      = 3 * time.Second
 )
 
 type Config struct {
-	NodePath    string
-	WorkDir     string
-	Args        []string
-	Env         []string // A nil or empty slice passes an empty environment.
-	Log         io.Writer
-	StopTimeout time.Duration
+	NodePath       string
+	WorkDir        string
+	Args           []string
+	Env            []string // A nil or empty slice passes an empty environment.
+	Revision       string
+	Log            io.Writer
+	StartupTimeout time.Duration
+	StopTimeout    time.Duration
 }
 
 type Snapshot struct {
 	State     State
 	PID       int
 	StartedAt time.Time
+	Revision  string
 	LastError string
 }
 
 type process struct {
-	cmd    *exec.Cmd
-	done   chan struct{}
-	forced bool
+	cmd          *exec.Cmd
+	done         chan struct{}
+	startupTimer *time.Timer
+	startupError string
+	forced       bool
 }
 
 type Supervisor struct {
@@ -75,6 +83,9 @@ func New(config Config) *Supervisor {
 	config.Env = append([]string{}, config.Env...)
 	if config.Log == nil {
 		config.Log = io.Discard
+	}
+	if config.StartupTimeout <= 0 {
+		config.StartupTimeout = defaultStartupTimeout
 	}
 	if config.StopTimeout <= 0 {
 		config.StopTimeout = defaultStopTimeout
@@ -137,7 +148,7 @@ func (s *Supervisor) start() error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = waitDelay
 	current := &process{cmd: cmd, done: make(chan struct{})}
-	cmd.Stdout = &readyWriter{output: s.log, onReady: func() { s.ready(current) }}
+	cmd.Stdout = &statusWriter{output: s.log, onLine: func(line string) { s.observeStartup(current, line) }}
 	cmd.Stderr = s.log
 	if err := cmd.Start(); err != nil {
 		err = fmt.Errorf("start bot: %w", err)
@@ -145,34 +156,92 @@ func (s *Supervisor) start() error {
 		return err
 	}
 	s.process = current
-	s.snapshot = Snapshot{State: Starting, PID: cmd.Process.Pid, StartedAt: time.Now()}
+	s.snapshot = Snapshot{
+		State: Starting, PID: cmd.Process.Pid, StartedAt: time.Now(), Revision: config.Revision,
+	}
+	current.startupTimer = time.AfterFunc(config.StartupTimeout, func() {
+		s.expireStartup(current)
+	})
 	go s.wait(current)
 	return nil
 }
 
-func (s *Supervisor) ready(current *process) {
+func (s *Supervisor) observeStartup(current *process, line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.process == current && s.snapshot.State == Starting {
-		s.snapshot.State = Running
+	if s.process != current || s.snapshot.State != Starting {
+		return
 	}
+	if line == readyLine && current.startupError == "" {
+		current.startupTimer.Stop()
+		s.snapshot.State = Running
+	} else if detail := startupDiagnostic(line); detail != "" {
+		current.startupError = detail
+	}
+}
+
+func (s *Supervisor) expireStartup(current *process) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.process != current || s.snapshot.State != Starting {
+		return
+	}
+	if current.startupError == "" {
+		current.startupError = "Bot 启动超时。请检查飞书连接后重试。"
+	}
+	// At this point the child has exceeded its own connection deadline.
+	if err := syscall.Kill(-current.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+		_ = current.cmd.Process.Kill()
+	}
+}
+
+func startupDiagnostic(line string) string {
+	fields, ok := strings.CutPrefix(line, startupFailurePrefix)
+	if !ok {
+		return ""
+	}
+	switch fields {
+	case "lark not_connected", "lark send_timeout":
+		return "飞书连接超时。请检查网络和应用配置。"
+	case "lark permission_denied":
+		return "飞书拒绝连接。请检查应用权限。"
+	case "lark rate_limited":
+		return "飞书连接已被限流。请稍后重试。"
+	case "lark unknown":
+		return "飞书连接失败。请检查网络和应用配置。"
+	case "webhook EADDRINUSE":
+		return "GitHub Webhook 端口已被占用。请在设置中修改端口。"
+	case "webhook EACCES", "webhook EPERM", "webhook EADDRNOTAVAIL", "webhook unknown":
+		return "GitHub Webhook 无法监听。请检查端口设置。"
+	case "configuration invalid_configuration":
+		return "Bot 配置有误。请检查设置，或在终端启动查看配置提示。"
+	case "bot unknown":
+		return "Bot 初始化失败。请检查运行环境和本地数据目录。"
+	}
+	return ""
 }
 
 func (s *Supervisor) wait(current *process) {
 	err := current.cmd.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	current.startupTimer.Stop()
 	switch {
 	case s.snapshot.State == Stopping && current.forced:
 		s.snapshot = Snapshot{State: Stopped, LastError: "Bot needed a forced stop."}
 	case s.snapshot.State == Stopping:
 		s.snapshot = Snapshot{State: Stopped}
 	default:
-		message := "Bot exited unexpectedly."
-		if err != nil {
-			message = fmt.Sprintf("Bot exited unexpectedly: %v", err)
+		message := current.startupError
+		if message == "" {
+			message = "Bot exited unexpectedly."
+			if err != nil {
+				message = fmt.Sprintf("Bot exited unexpectedly: %v", err)
+			}
 		}
-		s.snapshot = Snapshot{State: Failed, StartedAt: s.snapshot.StartedAt, LastError: message}
+		s.snapshot = Snapshot{
+			State: Failed, StartedAt: s.snapshot.StartedAt, Revision: s.snapshot.Revision, LastError: message,
+		}
 	}
 	s.process = nil
 	close(current.done)
@@ -254,19 +323,19 @@ func (w *lockedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-type readyWriter struct {
+type statusWriter struct {
 	output   io.Writer
-	onReady  func()
+	onLine   func(string)
 	line     []byte
 	overflow bool
 }
 
-func (w *readyWriter) Write(p []byte) (int, error) {
+func (w *statusWriter) Write(p []byte) (int, error) {
 	n, err := w.output.Write(p)
-	for p = p[:n]; len(p) > 0 && w.onReady != nil; {
+	for p = p[:n]; len(p) > 0; {
 		line, rest, terminated := bytes.Cut(p, []byte{'\n'})
 		if !w.overflow {
-			if len(w.line)+len(line) > len(readyLine)+1 {
+			if len(w.line)+len(line) > 128 {
 				w.overflow = true
 			} else {
 				w.line = append(w.line, line...)
@@ -275,9 +344,8 @@ func (w *readyWriter) Write(p []byte) (int, error) {
 		if !terminated {
 			break
 		}
-		if !w.overflow && string(bytes.TrimSuffix(w.line, []byte{'\r'})) == readyLine {
-			w.onReady()
-			w.onReady = nil
+		if !w.overflow {
+			w.onLine(string(bytes.TrimSuffix(w.line, []byte{'\r'})))
 		}
 		w.line = w.line[:0]
 		w.overflow = false

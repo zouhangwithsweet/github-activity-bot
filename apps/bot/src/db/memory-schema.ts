@@ -21,6 +21,7 @@ export const groupAnchors = sqliteTable(
   (table) => [
     unique().on(table.chatId, table.key),
     index('group_anchors_by_chat').on(table.chatId, sql`"sequence" DESC`),
+    index('group_anchors_by_topic').on(table.chatId, table.sessionKey),
   ],
 )
 
@@ -28,11 +29,17 @@ export const groupRepositories = sqliteTable(
   'group_repositories',
   {
     scope: text().notNull(),
+    nativeId: text('native_id').notNull(),
     repository: text().notNull(),
   },
-  (table) => [primaryKey({ columns: [table.scope, table.repository] })],
+  (table) => [primaryKey({ columns: [table.scope, table.nativeId, table.repository] })],
 )
 
-export const privateGroupSessions = sqliteTable('private_group_sessions', {
-  scope: text().primaryKey(),
-})
+export const privateGroupSessions = sqliteTable(
+  'private_group_sessions',
+  {
+    scope: text().notNull(),
+    nativeId: text('native_id').notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.scope, table.nativeId] })],
+)

@@ -109,7 +109,12 @@ await test('persists inbox versions, cursor, and most recent PR refs together', 
     assert.equal(
       store.observeInbox(
         [first, second, newer],
-        { etag: 'second', lastModified: 'Thu, 26 Nov 2026 04:00:00 GMT', pollIntervalMs: 90_000 },
+        {
+          etag: 'second',
+          lastModified: 'Thu, 26 Nov 2026 04:00:00 GMT',
+          pollIntervalMs: 90_000,
+          coveredThroughMs: 200,
+        },
         owner,
         200,
         Array.from({ length: 12 }, (_, i) => ({ repository, number: i + 1 })),
@@ -125,6 +130,7 @@ await test('persists inbox versions, cursor, and most recent PR refs together', 
       lastModified: 'Thu, 26 Nov 2026 04:00:00 GMT',
       pollIntervalMs: 90_000,
       lastPollAtMs: 200,
+      coveredThroughMs: 200,
     })
     assert.deepEqual(
       store.getInboxTrackedPullRequests(),

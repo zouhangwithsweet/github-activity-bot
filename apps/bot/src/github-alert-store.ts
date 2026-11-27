@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
+import type { GitHubNotificationCursor } from './github-activity.ts'
 import type { GitHubWebhookEvent } from './github-webhook.ts'
 import { isRepositoryName, type CheckState } from './github.ts'
 
@@ -20,12 +21,6 @@ export interface GitHubInboxEntry {
   title: string
   url: string
   repository: string
-}
-
-export interface GitHubInboxCursor {
-  etag?: string
-  lastModified?: string
-  pollIntervalMs?: number
 }
 
 export interface InboxTrackedPullRequest {
@@ -127,7 +122,8 @@ export function openGitHubAlertStore(databasePath: string) {
         etag TEXT,
         last_modified TEXT,
         poll_interval_ms INTEGER,
-        observed_at_ms INTEGER NOT NULL
+        observed_at_ms INTEGER NOT NULL,
+        covered_through_ms INTEGER
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS github_inbox_threads (
@@ -147,6 +143,11 @@ export function openGitHubAlertStore(databasePath: string) {
         repository TEXT PRIMARY KEY,
         star_count INTEGER NOT NULL CHECK (star_count >= 0),
         observed_at_ms INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS github_star_webhook_mode (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        repository TEXT
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS github_alert_outbox (
@@ -199,6 +200,13 @@ export function openGitHubAlertStore(databasePath: string) {
       }
     }
 
+    transaction(() => {
+      const columns = database.prepare('PRAGMA table_info(github_inbox_cursor)').all()
+      if (!columns.some(({ name }) => name === 'covered_through_ms')) {
+        database.exec('ALTER TABLE github_inbox_cursor ADD COLUMN covered_through_ms INTEGER')
+      }
+    })
+
     const getCi = database.prepare(`
       SELECT head_sha AS headSha, ci_state AS state, observed_at_ms AS observedAtMs
       FROM github_ci_observations WHERE repository = ? AND pr_number = ?
@@ -211,14 +219,17 @@ export function openGitHubAlertStore(databasePath: string) {
     `)
     const getCursor = database.prepare(`
       SELECT etag, last_modified AS lastModified, poll_interval_ms AS pollIntervalMs,
-             observed_at_ms AS lastPollAtMs
+             observed_at_ms AS lastPollAtMs, covered_through_ms AS coveredThroughMs
       FROM github_inbox_cursor WHERE singleton = 1
     `)
     const saveCursor = database.prepare(`
-      INSERT INTO github_inbox_cursor VALUES (1, ?, ?, ?, ?)
+      INSERT INTO github_inbox_cursor
+        (singleton, etag, last_modified, poll_interval_ms, observed_at_ms, covered_through_ms)
+      VALUES (1, ?, ?, ?, ?, ?)
       ON CONFLICT (singleton) DO UPDATE SET
         etag = excluded.etag, last_modified = excluded.last_modified,
-        poll_interval_ms = excluded.poll_interval_ms, observed_at_ms = excluded.observed_at_ms
+        poll_interval_ms = excluded.poll_interval_ms, observed_at_ms = excluded.observed_at_ms,
+        covered_through_ms = excluded.covered_through_ms
     `)
     const seeInboxThread = database.prepare(`
       INSERT INTO github_inbox_threads VALUES (?, ?)
@@ -249,6 +260,28 @@ export function openGitHubAlertStore(databasePath: string) {
       INSERT INTO github_star_counts (repository, star_count, observed_at_ms) VALUES (?, ?, ?)
       ON CONFLICT (repository) DO UPDATE SET
         star_count = excluded.star_count, observed_at_ms = excluded.observed_at_ms
+    `)
+    const getStarWebhookMode = database.prepare(`
+      SELECT repository FROM github_star_webhook_mode WHERE singleton = 1
+    `)
+    const setStarWebhookMode = database.prepare(`
+      INSERT INTO github_star_webhook_mode VALUES (1, ?)
+      ON CONFLICT (singleton) DO UPDATE SET repository = excluded.repository
+    `)
+    const resetLegacyStarCounts = database.prepare(`
+      DELETE FROM github_star_counts WHERE repository = ?
+      OR EXISTS (
+        SELECT 1 FROM github_webhook_inbox
+        WHERE repository = github_star_counts.repository COLLATE NOCASE
+          AND kind = 'star' AND action = 'created' AND status = 'complete'
+          AND completed_at_ms >= github_star_counts.observed_at_ms
+      )
+    `)
+    const resetStarCount = database.prepare('DELETE FROM github_star_counts WHERE repository = ?')
+    const completePriorStarReceipts = database.prepare(`
+      UPDATE github_webhook_inbox
+      SET status = 'complete', completed_at_ms = ?
+      WHERE repository = ? COLLATE NOCASE AND kind = 'star' AND status = 'pending'
     `)
     const queue = database.prepare(`
       INSERT INTO github_alert_outbox (id, recipient_open_id, text, status, due_at_ms)
@@ -309,22 +342,24 @@ export function openGitHubAlertStore(databasePath: string) {
       WHERE delivery_id = ? AND status = 'pending' AND due_at_ms <= ?
     `)
 
-    function getInboxCursor(): (GitHubInboxCursor & { lastPollAtMs: number }) | undefined {
+    function getInboxCursor(): (GitHubNotificationCursor & { lastPollAtMs: number }) | undefined {
       const row = getCursor.get() as
         | {
             etag: string | null
             lastModified: string | null
             pollIntervalMs: number | null
             lastPollAtMs: number
+            coveredThroughMs: number | null
           }
         | undefined
       if (!row) return
-      const { etag, lastModified, pollIntervalMs, lastPollAtMs } = row
+      const { etag, lastModified, pollIntervalMs, lastPollAtMs, coveredThroughMs } = row
       return {
         lastPollAtMs,
         ...(etag === null ? {} : { etag }),
         ...(lastModified === null ? {} : { lastModified }),
         ...(pollIntervalMs === null ? {} : { pollIntervalMs }),
+        ...(coveredThroughMs === null ? {} : { coveredThroughMs }),
       }
     }
 
@@ -362,7 +397,7 @@ export function openGitHubAlertStore(databasePath: string) {
       },
       observeInbox(
         items: readonly GitHubInboxEntry[],
-        cursor: GitHubInboxCursor,
+        cursor: GitHubNotificationCursor,
         recipientOpenId: string,
         nowMs: number,
         tracked: readonly InboxTrackedPullRequest[] = [],
@@ -405,6 +440,7 @@ export function openGitHubAlertStore(databasePath: string) {
             cursor.lastModified ?? null,
             cursor.pollIntervalMs ?? null,
             nowMs,
+            cursor.coveredThroughMs ?? null,
           )
           return created
         })
@@ -415,6 +451,20 @@ export function openGitHubAlertStore(databasePath: string) {
           repository: row.repository as string,
           number: row.number as number,
         }))
+      },
+      configureStarWebhook(repository: string | undefined, enabled: boolean, nowMs: number) {
+        const repositoryKey = repository?.toLowerCase() ?? null
+        const webhook = enabled ? repositoryKey : null
+        transaction(() => {
+          const previous = getStarWebhookMode.get()
+          // Older releases paused Star polling whenever a webhook was configured.
+          if (!previous) resetLegacyStarCounts.run(repositoryKey)
+          if (webhook && previous && previous.repository !== webhook) {
+            completePriorStarReceipts.run(nowMs, webhook)
+          }
+          setStarWebhookMode.run(webhook)
+          if (webhook) resetStarCount.run(webhook)
+        })
       },
       observeStarCount(
         repository: string,
@@ -429,6 +479,7 @@ export function openGitHubAlertStore(databasePath: string) {
         }
         return transaction(() => {
           const repositoryKey = repository.toLowerCase()
+          if (getStarWebhookMode.get()?.repository === repositoryKey) return 0
           const previous = getStarCount.get(repositoryKey) as
             | { starCount: number; observedAtMs: number }
             | undefined
@@ -501,6 +552,14 @@ export function openGitHubAlertStore(databasePath: string) {
         return transaction(() => {
           const event = completeWebhook.get(nowMs, deliveryId) as GitHubWebhookRow | undefined
           if (!event) return false
+          const starWebhookMode = getStarWebhookMode.get()
+          if (
+            event.kind === 'star' &&
+            starWebhookMode &&
+            starWebhookMode.repository !== event.repository.toLowerCase()
+          ) {
+            return true
+          }
           const text = webhookAlertText(event)
           if (recipientOpenId && text) queue.run(randomUUID(), recipientOpenId, text, nowMs)
           return true

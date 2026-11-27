@@ -15,34 +15,54 @@ export function trackGroupGitHubAccess(
   isPublicRepository: PublicRepositoryQuery,
   state?: { scope: string; memory: GroupAccessMemory },
 ) {
-  const repositories = new Set(state?.memory.getGroupRepositories(state.scope))
-  let privateConversation = state?.memory.isGroupPrivate(state.scope) ?? false
+  const repositories = new Set<string>()
+  let nativeId: string | undefined
+  let privateConversation = false
+
+  function boundId() {
+    if (!nativeId) throw new Error('Group privacy state needs the opened Codex session ID.')
+    return nativeId
+  }
 
   function rememberRepository(repository: string) {
     const name = repository.toLowerCase()
     if (repositories.has(name)) return
-    if (state) state.memory.rememberGroupRepository(state.scope, name)
+    if (state) state.memory.rememberGroupRepository(state.scope, boundId(), name)
     repositories.add(name)
   }
 
   function markPrivate() {
     if (privateConversation) return
-    if (state) state.memory.markGroupPrivate(state.scope)
+    if (state) state.memory.markGroupPrivate(state.scope, boundId())
     privateConversation = true
   }
 
-  function trackQuery<Arguments extends unknown[], Result extends { repository: string } | null>(
-    query: (repository: string, ...args: Arguments) => Promise<Result>,
-  ) {
+  function trackQuery<
+    Arguments extends unknown[],
+    Result extends { repository: string; restrictedRepository?: true } | null,
+  >(query: (repository: string, ...args: Arguments) => Promise<Result>) {
     return async (repository: string, ...args: Arguments) => {
       rememberRepository(repository)
       const result = await query(repository, ...args)
-      if (result) rememberRepository(result.repository)
+      if (result) {
+        rememberRepository(result.repository)
+        if (result.restrictedRepository) markPrivate()
+      }
       return result
     }
   }
 
   return {
+    bindSession(id: string) {
+      if (!state) return
+      if (!id || nativeId)
+        throw new Error('Expected one Codex session ID per group access tracker.')
+      for (const repository of state.memory.getGroupRepositories(state.scope, id)) {
+        repositories.add(repository)
+      }
+      privateConversation = state.memory.isGroupPrivate(state.scope, id)
+      nativeId = id
+    },
     tools: {
       list: () => {
         markPrivate()
@@ -53,13 +73,14 @@ export function trackGroupGitHubAccess(
       reviews: trackQuery(tools.reviews),
     },
     async canReplyInGroup() {
+      if (state) boundId()
       if (privateConversation) return false
       const visibility = await Promise.all(
-        Array.from(repositories, (repo) => isPublicRepository(repo).catch(() => false)),
+        Array.from(repositories, (repo) => isPublicRepository(repo).catch(() => undefined)),
       )
       // A later turn can reuse tool results already present in this conversation.
       if (visibility.includes(false)) markPrivate()
-      return !privateConversation
+      return !privateConversation && visibility.every((isPublic) => isPublic === true)
     },
   }
 }

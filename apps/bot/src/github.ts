@@ -22,6 +22,7 @@ const pullRequestDetailQuery = `
   query PullRequestDetail($owner: String!, $repo: String!, $number: Int!) {
     repository(owner: $owner, name: $repo) {
       nameWithOwner
+      visibility
       pullRequest(number: $number) {
         number
         title
@@ -48,6 +49,7 @@ const pullRequestReviewsQuery = `
   query PullRequestReviews($owner: String!, $repo: String!, $number: Int!) {
     repository(owner: $owner, name: $repo) {
       nameWithOwner
+      visibility
       pullRequest(number: $number) {
         number
         url
@@ -224,6 +226,7 @@ export interface PullRequestDetail extends Omit<
   'isDraft' | 'statusCheckRollup'
 > {
   repository: string
+  restrictedRepository?: true
   draft: boolean
   checks: CheckState | null
   bodyTruncated: boolean
@@ -379,7 +382,7 @@ export function createPullRequestQuery(
 
 interface PullRequestGraphQLResponse<Node> {
   data?: {
-    repository: { nameWithOwner: string; pullRequest: Node | null } | null
+    repository: { nameWithOwner: string; visibility?: string; pullRequest: Node | null } | null
   } | null
   errors?: { type?: string }[]
 }
@@ -431,7 +434,13 @@ async function getPullRequestNode<Node>(
   const repository = result.data.repository
   if (!repository?.pullRequest) return null
 
-  return { repository: repository.nameWithOwner, node: repository.pullRequest }
+  return {
+    repository: repository.nameWithOwner,
+    node: repository.pullRequest,
+    ...(repository.visibility === 'PRIVATE' || repository.visibility === 'INTERNAL'
+      ? { restrictedRepository: true as const }
+      : {}),
+  }
 }
 
 async function getPullRequestDetail(
@@ -450,10 +459,11 @@ async function getPullRequestDetail(
     request,
   )
   if (!result) return null
-  const { isDraft, statusCheckRollup, body, ...fields } = result.node
+  const { node, ...repository } = result
+  const { isDraft, statusCheckRollup, body, ...fields } = node
   return {
     ...fields,
-    repository: result.repository,
+    ...repository,
     draft: isDraft,
     checks: statusCheckRollup?.state ?? null,
     body: body.slice(0, maxDescriptionLength),
@@ -551,6 +561,7 @@ interface CommitStatus {
 
 interface PullRequestChecks {
   repository: string
+  restrictedRepository?: true
   number: number
   url: string
   headRefOid: string
@@ -567,7 +578,7 @@ export type PullRequestChecksQuery = (
 interface GitHubPullRequestHead {
   number: number
   html_url: string
-  base: { repo: { full_name: string } }
+  base: { repo: { full_name: string; private?: boolean; visibility?: string } }
   head: { sha: string }
 }
 
@@ -663,7 +674,8 @@ export function createPullRequestChecksQuery(
 
     const pullRequest = (await response.json()) as GitHubPullRequestHead
     const headRefOid = pullRequest.head.sha
-    const canonicalRepository = pullRequest.base.repo.full_name
+    const base = pullRequest.base.repo
+    const canonicalRepository = base.full_name
     if (!/^[a-f0-9]{40}$/i.test(headRefOid) || !isRepositoryName(canonicalRepository)) {
       throw new Error('GitHub did not return a valid pull request head commit.')
     }
@@ -707,6 +719,9 @@ export function createPullRequestChecksQuery(
 
     return {
       repository: canonicalRepository,
+      ...(base.private === true || base.visibility === 'private' || base.visibility === 'internal'
+        ? { restrictedRepository: true as const }
+        : {}),
       number: pullRequest.number,
       url: pullRequest.html_url,
       headRefOid,
@@ -767,6 +782,7 @@ export interface PullRequestReviews extends Pick<
   'number' | 'url' | 'reviewDecision'
 > {
   repository: string
+  restrictedRepository?: true
   reviews: (ReviewComment & { state: string; submittedAt: string })[]
   unresolvedThreads: {
     path: string
@@ -824,7 +840,8 @@ export function createPullRequestReviewsQuery(
           request,
         )
         if (!result) continue
-        const { latestReviews, reviewThreads, comments, ...fields } = result.node
+        const { node, ...repositoryInfo } = result
+        const { latestReviews, reviewThreads, comments, ...fields } = node
         const reviews = (latestReviews?.nodes ?? []).flatMap((review) =>
           review?.submittedAt && !review.isMinimized && review.state !== 'PENDING'
             ? [{ ...reviewComment(review), state: review.state, submittedAt: review.submittedAt }]
@@ -847,7 +864,7 @@ export function createPullRequestReviewsQuery(
 
         return {
           ...fields,
-          repository: result.repository,
+          ...repositoryInfo,
           reviews,
           unresolvedThreads,
           discussionComments: publishedComments(comments.nodes),
@@ -864,11 +881,12 @@ export function createPullRequestReviewsQuery(
   }
 }
 
-export type PublicRepositoryQuery = (repository: string) => Promise<boolean>
+// Indeterminate results block this reply but do not permanently mark the conversation private.
+export type PublicRepositoryQuery = (repository: string) => Promise<boolean | undefined>
 
 export function createPublicRepositoryQuery(request: typeof fetch = fetch): PublicRepositoryQuery {
   return async (repository) => {
-    if (!isRepositoryName(repository)) return false
+    if (!isRepositoryName(repository)) return
     try {
       const response = await request(`https://api.github.com/repos/${repository}`, {
         headers: {
@@ -880,21 +898,23 @@ export function createPublicRepositoryQuery(request: typeof fetch = fetch): Publ
       })
       if (!response.ok) {
         await response.body?.cancel()
-        return false
+        return
       }
       const data = (await response.json()) as {
         full_name?: unknown
         visibility?: unknown
         private?: unknown
       }
-      return (
-        data.visibility === 'public' &&
-        data.private === false &&
-        typeof data.full_name === 'string' &&
-        data.full_name.toLowerCase() === repository.toLowerCase()
+      if (
+        typeof data.full_name !== 'string' ||
+        data.full_name.toLowerCase() !== repository.toLowerCase()
       )
+        return
+      if (data.visibility === 'private' || data.visibility === 'internal' || data.private === true)
+        return false
+      if (data.visibility === 'public' && data.private === false) return true
     } catch {
-      return false
+      return undefined
     }
   }
 }

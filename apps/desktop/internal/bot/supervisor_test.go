@@ -120,6 +120,27 @@ func TestForceStopAndReportCrash(t *testing.T) {
 	}
 }
 
+func TestStartupDiagnosticsAndDeadline(t *testing.T) {
+	failing, _ := testSupervisor(t, "startup-failure", "", time.Second)
+	if err := failing.Start(); err != nil {
+		t.Fatal(err)
+	}
+	await(t, func() bool { return failing.Snapshot().State == Failed })
+	if got := failing.Snapshot().LastError; got != "GitHub Webhook 端口已被占用。请在设置中修改端口。" {
+		t.Fatalf("expected the classified startup failure, got %q", got)
+	}
+
+	hanging, _ := testSupervisor(t, "no-readiness", "", time.Second)
+	hanging.config.StartupTimeout = 70 * time.Millisecond
+	if err := hanging.Start(); err != nil {
+		t.Fatal(err)
+	}
+	await(t, func() bool { return hanging.Snapshot().State == Failed })
+	if got := hanging.Snapshot(); got.PID != 0 || !strings.Contains(got.LastError, "启动超时") {
+		t.Fatalf("expected a failed startup with no live process, got %+v", got)
+	}
+}
+
 func TestSupervisorSubprocess(t *testing.T) {
 	mode := os.Getenv("MYGO_BOT_TEST_MODE")
 	if mode == "" {
@@ -130,6 +151,18 @@ func TestSupervisorSubprocess(t *testing.T) {
 	}
 	if mode == "crash" {
 		os.Exit(7)
+	}
+	if mode == "startup-failure" {
+		fmt.Fprintln(os.Stderr, "raw error with synthetic-private-data")
+		fmt.Fprint(os.Stdout, startupFailurePrefix+"webhook ")
+		fmt.Fprintln(os.Stdout, "EADDRINUSE")
+		fmt.Fprintln(os.Stdout, startupFailurePrefix+"webhook synthetic-private-data")
+		os.Exit(1)
+	}
+	if mode == "no-readiness" {
+		for {
+			time.Sleep(time.Second)
+		}
 	}
 	if mode == "ignore-signal" {
 		signal.Ignore(syscall.SIGTERM)

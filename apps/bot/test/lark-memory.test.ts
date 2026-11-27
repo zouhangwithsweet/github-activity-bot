@@ -93,11 +93,11 @@ await test('adopts the handwritten memory schema and leaves the GitHub alert out
       { key: 'om_first', sessionKey: group },
       { key: 'om_reply', sessionKey: group, threadId: 'omt_topic' },
     ])
-    assert.deepEqual(memory.getGroupRepositories(group), ['example/legacy'])
-    assert.equal(memory.isGroupPrivate(group), true)
+    assert.deepEqual(memory.getGroupRepositories(group, 'legacy-group'), ['example/legacy'])
+    assert.equal(memory.isGroupPrivate(group, 'legacy-group'), true)
     memory.saveSession(dm, 'new-dm')
     memory.saveGroupAnchor('oc_chat', { key: 'om_first', sessionKey: group, threadId: 'omt_topic' })
-    memory.rememberGroupRepository(group, 'EXAMPLE/New')
+    memory.rememberGroupRepository(group, 'legacy-group', 'EXAMPLE/New')
   } finally {
     memory.close()
   }
@@ -110,8 +110,11 @@ await test('adopts the handwritten memory schema and leaves the GitHub alert out
       { key: 'om_reply', sessionKey: group, threadId: 'omt_topic' },
       { key: 'om_first', sessionKey: group, threadId: 'omt_topic' },
     ])
-    assert.deepEqual(restored.getGroupRepositories(group), ['example/legacy', 'example/new'])
-    assert.equal(restored.isGroupPrivate(group), true)
+    assert.deepEqual(restored.getGroupRepositories(group, 'legacy-group'), [
+      'example/legacy',
+      'example/new',
+    ])
+    assert.equal(restored.isGroupPrivate(group, 'legacy-group'), true)
   } finally {
     restored.close()
   }
@@ -203,9 +206,9 @@ await test('restores session IDs, ordered group anchors, and private delivery st
     first.saveGroupAnchor('oc_other', { key: 'old', sessionKey: 'group:oc_other:omt_other' })
     first.saveGroupAnchor('oc_chat', { key: 'replied', sessionKey: group, threadId: 'omt_topic' })
     first.saveGroupAnchor('oc_chat', { key: 'old', sessionKey: group, threadId: 'omt_topic' })
-    first.rememberGroupRepository(group, 'Example/Repo')
-    first.rememberGroupRepository(group, 'example/repo')
-    first.markGroupPrivate(group)
+    first.rememberGroupRepository(group, 'codex-group', 'Example/Repo')
+    first.rememberGroupRepository(group, 'codex-group', 'example/repo')
+    first.markGroupPrivate(group, 'codex-group')
   } finally {
     first.close()
   }
@@ -222,9 +225,9 @@ await test('restores session IDs, ordered group anchors, and private delivery st
     assert.deepEqual(restored.getGroupAnchors('oc_other'), [
       { key: 'old', sessionKey: 'group:oc_other:omt_other' },
     ])
-    assert.deepEqual(restored.getGroupRepositories(group), ['example/repo'])
-    assert.equal(restored.isGroupPrivate(group), true)
-    assert.equal(restored.isGroupPrivate(dm), false)
+    assert.deepEqual(restored.getGroupRepositories(group, 'codex-group'), ['example/repo'])
+    assert.equal(restored.isGroupPrivate(group, 'codex-group'), true)
+    assert.equal(restored.isGroupPrivate(dm, 'codex-dm'), false)
   } finally {
     restored.close()
   }
@@ -241,18 +244,21 @@ await test('separates bot and owner identities and conditionally removes a missi
     const group = 'group:oc_chat:omt_topic'
     original.saveSession(group, 'old')
     original.saveGroupAnchor('oc_chat', { key: 'old', sessionKey: group })
-    original.rememberGroupRepository(group, 'example/repo')
-    original.markGroupPrivate(group)
+    original.rememberGroupRepository(group, 'old', 'example/repo')
+    original.markGroupPrivate(group, 'old')
     concurrent.saveSession(group, 'replacement')
     original.forgetSession(group, 'old')
     assert.equal(original.getSession(group), 'replacement')
+    assert.equal(concurrent.isGroupPrivate(group, 'old'), true)
+    assert.equal(concurrent.isGroupPrivate(group, 'replacement'), false)
+    assert.deepEqual(concurrent.getGroupRepositories(group, 'replacement'), [])
 
     for (const memory of [otherOwner, otherApp]) {
       assert.notEqual(memory.cwd, original.cwd)
       assert.equal(memory.getSession(group), undefined)
       assert.deepEqual(memory.getGroupAnchors('oc_chat'), [])
-      assert.deepEqual(memory.getGroupRepositories(group), [])
-      assert.equal(memory.isGroupPrivate(group), false)
+      assert.deepEqual(memory.getGroupRepositories(group, 'old'), [])
+      assert.equal(memory.isGroupPrivate(group, 'old'), false)
     }
 
     original.forgetSession(group, 'replacement')
@@ -292,12 +298,23 @@ await test('restores an authorized group reply anchor without losing private del
     assert.ok(start)
     groupScope = start.sessionKey
     router.recordReply(start, 'om_bot', 'omt_thread')
+    original.saveSession(groupScope, 'native-first')
     const access = trackGroupGitHubAccess(github, async () => false, {
       memory: original,
       scope: groupScope,
     })
+    access.bindSession('native-first')
     await access.tools.detail('example/private', 3)
     assert.equal(await access.canReplyInGroup(), false)
+    for (let index = 0; index < 4_096; index++) {
+      original.saveGroupAnchor('oc_test', {
+        key: `oc_test:message:om_later_${index}`,
+        sessionKey: `group:oc_test:om_later_${index}`,
+      })
+    }
+    assert.ok(
+      !original.getGroupAnchors('oc_test').some(({ sessionKey }) => sessionKey === groupScope),
+    )
   } finally {
     original.close()
   }
@@ -313,12 +330,24 @@ await test('restores an authorized group reply anchor without losing private del
       replyToMessageId: 'om_bot',
       threadId: 'omt_thread',
     }
-    assert.equal(router.route(followUp)?.sessionKey, groupScope)
+    const routed = router.route(followUp)
+    assert.equal(routed?.sessionKey, groupScope)
+    assert.equal(routed.quotedMessageId, 'om_bot')
     assert.equal(router.route({ ...followUp, senderId: 'ou_other' }), undefined)
     const access = trackGroupGitHubAccess(github, async () => true, {
       memory: restored,
       scope: groupScope,
     })
+    access.bindSession('native-first')
+    assert.equal(await access.canReplyInGroup(), false)
+    const fresh = trackGroupGitHubAccess(github, async () => true, {
+      memory: restored,
+      scope: groupScope,
+    })
+    assert.equal(restored.requestSessionReset(groupScope), true)
+    restored.saveSession(groupScope, 'native-replacement')
+    fresh.bindSession('native-replacement')
+    assert.equal(await fresh.canReplyInGroup(), true)
     assert.equal(await access.canReplyInGroup(), false)
   } finally {
     restored.close()

@@ -116,7 +116,7 @@ await test('routes an owner follow-up to its original group thread and isolates 
   assert.equal(routedReply?.sessionKey, start.sessionKey)
   assert.equal(routedReply?.mentionedBot, false)
   assert.equal(routedReply?.replyToMessageId, 'om_reply')
-  assert.equal(routedReply?.quotedMessageId, undefined)
+  assert.equal(routedReply?.quotedMessageId, 'om_reply')
   assert.equal(routedReply?.inferIntent, undefined)
   const crossThread = { ...quoteReply, messageId: 'om_other_topic', threadId: 'omt_unrelated' }
   assert.equal(router.route(crossThread), undefined)
@@ -157,12 +157,13 @@ await test('looks up only the explicitly quoted group message and treats it as c
     replyToMessageId: start.messageId,
   })
   assert.ok(followUp)
-  assert.deepEqual(
-    await resolveLarkQuotePrompt(followUp, async () =>
-      assert.fail('accepted messages are already in the session'),
-    ),
-    { kind: 'ready', question: mention.content },
-  )
+  const resolved = await resolveLarkQuotePrompt(followUp, async (chatId, messageId) => {
+    assert.equal(chatId, 'oc_project')
+    assert.equal(messageId, start.messageId)
+    return 'The original result for example/project#42'
+  })
+  assert.equal(resolved.kind, 'ready')
+  assert.match(resolved.question, /original result for example\/project#42/)
 })
 
 await test('normalizes rich text only from the exact message in the destination group', async () => {
