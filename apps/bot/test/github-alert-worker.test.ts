@@ -20,6 +20,57 @@ const pullRequest = {
   state: 'PENDING',
 } satisfies PullRequestObservation
 
+await test('polls Stars without CI, keeps failed repos retryable, and delivers one private digest', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'github-star-worker-'))
+  const store = openGitHubAlertStore(join(directory, 'memory.sqlite'))
+  t.after(() => {
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  let now = 10_000
+  const repository = 'example/site'
+  const reads: string[] = []
+  const delivered: string[] = []
+  const worker = createGitHubAlertWorker({
+    store,
+    recipientOpenId: owner,
+    webhookRepository: 'example/webhook',
+    now: () => now,
+    queryStars: {
+      listRepositories: async () => [
+        { repository },
+        { repository: 'EXAMPLE/SITE' },
+        { repository: 'example/webhook' },
+        { repository: 'example/denied' },
+        { repository: 'example/listed', starCount: 0 },
+      ],
+      async readStarCount(name) {
+        assert.notEqual(name, 'example/webhook')
+        assert.notEqual(name, 'example/listed')
+        if (name === 'example/denied') throw new Error('access denied')
+        reads.push(name.toLowerCase())
+        return now < 12_000 ? 4 : 6
+      },
+    },
+    async send(alert) {
+      assert.equal(alert.recipientOpenId, owner)
+      delivered.push(alert.text)
+      return { kind: 'sent' }
+    },
+  })
+  await worker.pollStars()
+  await worker.deliver()
+  assert.deepEqual(delivered, [])
+  now = 13_000
+  await worker.pollStars()
+  await worker.pollStars()
+  await worker.deliver()
+  await worker.deliver()
+  assert.deepEqual(reads, [repository, repository, repository])
+  assert.equal(delivered.length, 1)
+  assert.match(delivered[0], /净增 2/)
+})
+
 await test('reopens a signed delivery and shares one current-head CI transition with polling', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'github-webhook-worker-'))
   t.after(() => rmSync(directory, { recursive: true, force: true }))

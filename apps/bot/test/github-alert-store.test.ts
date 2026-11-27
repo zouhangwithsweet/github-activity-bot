@@ -160,6 +160,80 @@ await test('persists inbox versions, cursor, and most recent PR refs together', 
   }
 })
 
+await test('queues one Star count increase after a restart and ignores decreases and stale results', (t) => {
+  const path = scratchDatabase(t)
+  let store = openGitHubAlertStore(path)
+  try {
+    assert.equal(store.observeStarCount(repository, 10, owner, 100), 0)
+    assert.equal(store.observeStarCount('example/bot', 8, owner, 110), 0)
+    assert.equal(store.claimDue(110), undefined)
+    store.close()
+
+    store = openGitHubAlertStore(path)
+    const peer = openGitHubAlertStore(path)
+    try {
+      assert.equal(store.observeStarCount(repository, 12, owner, 120), 1)
+      assert.equal(peer.observeStarCount('EXAMPLE/BOT', 12, owner, 120), 0)
+      assert.equal(peer.observeStarCount('EXAMPLE/BOT', 99, owner, 120), 0)
+      assert.equal(peer.observeStarCount('EXAMPLE/BOT', 9, owner, 119), 0)
+      assert.equal(peer.observeStarCount('EXAMPLE/BOT', 12, owner, 130), 0)
+      const alert = peer.claimDue(130)
+      assert.ok(alert)
+      assert.equal(alert.recipientOpenId, owner)
+      assert.equal(
+        alert.text,
+        'GitHub Star · Example/Bot\n净增 4 · 当前 12\nhttps://github.com/Example/Bot',
+      )
+      assert.equal(store.claimDue(130), undefined)
+    } finally {
+      peer.close()
+    }
+  } finally {
+    store.close()
+  }
+})
+
+await test('tracks Star counts separately per repository and rejects invalid inputs', (t) => {
+  const store = openGitHubAlertStore(scratchDatabase(t))
+  try {
+    assert.equal(store.observeStarCount(repository, 10, owner, 100), 0)
+    assert.equal(store.observeStarCount('example/other', 0, owner, 100), 0)
+    assert.throws(() => store.observeStarCount('example/../bad', 12, owner, 110), /owner\/repo/)
+    assert.throws(() => store.observeStarCount('example/other', -1, owner, 110), /nonnegative/)
+    assert.equal(store.observeStarCount('Example/Other', 1, owner, 110), 1)
+    const digest = store.claimDue(110)
+    assert.ok(digest)
+    assert.equal(
+      digest.text,
+      'GitHub Star · Example/Other\n净增 1 · 当前 1\nhttps://github.com/Example/Other',
+    )
+    assert.equal(store.claimDue(110), undefined)
+  } finally {
+    store.close()
+  }
+})
+
+await test('rolls back the Star count when an outbox insert fails', (t) => {
+  const path = scratchDatabase(t)
+  const store = openGitHubAlertStore(path)
+  const database = new DatabaseSync(path)
+  try {
+    assert.equal(store.observeStarCount(repository, 10, owner, 1_100), 0)
+    database.exec(`
+      CREATE TRIGGER reject_alert BEFORE INSERT ON github_alert_outbox
+      BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END;
+    `)
+    assert.throws(() => store.observeStarCount(repository, 14, owner, 2_100), /outbox unavailable/)
+    assert.equal(store.claimDue(2_100), undefined)
+    database.exec('DROP TRIGGER reject_alert')
+    assert.equal(store.observeStarCount(repository, 14, owner, 2_100), 1)
+    assert.match(store.claimDue(2_100)?.text ?? '', /净增 4 · 当前 14/)
+  } finally {
+    database.close()
+    store.close()
+  }
+})
+
 await test('claims once, retries at the due time, and leaves interrupted sends unknown', (t) => {
   const path = scratchDatabase(t)
   let store = openGitHubAlertStore(path)

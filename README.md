@@ -86,6 +86,18 @@ SQLite 默认保存在 `~/.local/state/github-activity-bot`，可通过 `LARK_ME
 
 提醒与状态变化一起写入本地 SQLite。重启会继续发送已入队且明确待发的提醒。发送前确认断线或 Lark 限流会按退避重试。发送结果无法确认时，队列会保留记录供核对。终端的 `github_alert.delivery` 记录提醒 ID 和发送结果。
 
+### Star 提醒
+
+在 `.env` 选择要跟踪的范围，再重启 Bot。Star 提醒单独启用，通过绑定账号的 Lark 私聊发送。
+
+| 配置 | 跟踪范围 |
+| --- | --- |
+| `GH_STAR_REPO_SOURCE=watched` | 当前 GitHub 凭据账号 Watch 的仓库。Fine-grained token 需要 Watching 用户权限（Read）。 |
+| `GH_STAR_REPO_SOURCE=accessible` | 凭据能列出的自有仓库、协作仓库和组织仓库。 |
+| `GH_STAR_REPOSITORIES=owner/repo,owner/another-repo` | 指定仓库。可单独使用，或加到前两种范围中。 |
+
+默认每 5 分钟读取一次，可以用 `GH_STAR_POLL_SECONDS` 调整。每个仓库首次读取时只记录基线。后续发现总数增长时，按仓库私聊发出净增量和当前总数，重启后沿用已有基线。同一轮的加星与取消 Star 会反映在净增量里。已配置 Webhook 的仓库通过 Webhook 接收逐条 Star 事件。
+
 ## GitHub App Webhook
 
 1. 为一个测试仓库安装 GitHub App。在 App 后台订阅 Star、Fork、Pull request，以及 Checks、Workflow run 或 Commit status 中需要的事件。权限按订阅事件选择。

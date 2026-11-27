@@ -5,6 +5,7 @@ import {
   type PullRequestActivityQuery,
 } from './github-activity.ts'
 import type { CiObservation, GitHubAlertStore } from './github-alert-store.ts'
+import type { GitHubStarQueries } from './github-stars.ts'
 import type { GitHubWebhookEvent } from './github-webhook.ts'
 import type { PullRequestChecksQuery } from './github.ts'
 import type { AlertDelivery, AlertToDeliver } from './lark-alert-delivery.ts'
@@ -12,6 +13,8 @@ import type { AlertDelivery, AlertToDeliver } from './lark-alert-delivery.ts'
 const inboxIntervalMs = 60_000
 const idleDeliveryMs = 5_000
 const webhookIntervalMs = 3_000
+const starIntervalMs = 5 * 60_000
+const starBatchSize = 8
 const retryDelaysMs = [15_000, 30_000, 60_000]
 const failedCheckResults = new Set([
   'failure',
@@ -24,9 +27,10 @@ const failedCheckResults = new Set([
 interface AlertWorkerOptions {
   store: GitHubAlertStore
   recipientOpenId: string
-  queryCi: PullRequestActivityQuery
+  queryCi?: PullRequestActivityQuery
   queryChecks?: PullRequestChecksQuery
   queryInbox?: GitHubNotificationsQuery
+  queryStars?: GitHubStarQueries
   webhookRepository?: string
   send: (alert: AlertToDeliver) => Promise<AlertDelivery>
   now?: () => number
@@ -50,6 +54,7 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
     queryCi,
     queryChecks,
     queryInbox,
+    queryStars,
     webhookRepository,
     send,
     report,
@@ -59,9 +64,11 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
   let ciQueue = Promise.resolve()
 
   function refreshCi(events?: readonly GitHubWebhookEvent[]) {
+    const query = queryCi
+    if (!query) return
     const refresh = ciQueue.then(async () => {
       const startedAt = now()
-      const result = await queryCi(store.getInboxTrackedPullRequests())
+      const result = await query(store.getInboxTrackedPullRequests())
       login = result.login
       const pullRequests = events
         ? result.pullRequests.filter((pr) =>
@@ -119,6 +126,47 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
     async pollCi() {
       await refreshCi()
     },
+    async pollStars(signal?: AbortSignal) {
+      if (!queryStars) return
+      const listedAt = now()
+      const repositories = await queryStars.listRepositories(signal)
+      const delegatedRepository = webhookRepository?.toLowerCase()
+      const targets = [
+        ...new Map(repositories.map((entry) => [entry.repository.toLowerCase(), entry])).values(),
+      ].filter(({ repository }) => repository.toLowerCase() !== delegatedRepository)
+      let observed = 0
+      let unavailable = 0
+      let queued = 0
+      let retryAfterMs = 0
+      for (let offset = 0; offset < targets.length; offset += starBatchSize) {
+        signal?.throwIfAborted()
+        const results = await Promise.allSettled(
+          targets.slice(offset, offset + starBatchSize).map(async ({ repository, starCount }) => {
+            const startedAt = starCount === undefined ? now() : listedAt
+            const count = starCount ?? (await queryStars.readStarCount(repository, signal))
+            signal?.throwIfAborted()
+            return store.observeStarCount(repository, count, recipientOpenId, startedAt)
+          }),
+        )
+        for (const result of results) {
+          if (result.status === 'fulfilled') {
+            observed++
+            queued += result.value
+          } else {
+            unavailable++
+            if (result.reason instanceof GitHubActivityPollError) {
+              retryAfterMs = Math.max(retryAfterMs, result.reason.retryAfterMs ?? 0)
+            }
+          }
+        }
+        if (retryAfterMs > 0) break
+      }
+      signal?.throwIfAborted()
+      report?.('stars_polled', { repositories: targets.length, observed, unavailable, queued })
+      if (retryAfterMs > 0) {
+        throw new GitHubActivityPollError('GitHub Star polling was rate limited.', retryAfterMs)
+      }
+    },
     async processWebhooks() {
       if (!webhookRepository) return
       const pending = store.getPendingWebhooks(now(), webhookRepository)
@@ -131,6 +179,7 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
 
       try {
         const result = await refreshCi(refreshes.map(({ event }) => event))
+        if (!result) return
         const unavailable = new Set(
           result.unavailableRepositories.map((repo) => repo.toLowerCase()),
         )
@@ -216,7 +265,11 @@ export function createGitHubAlertWorker(options: AlertWorkerOptions) {
 }
 
 export async function runGitHubAlerts(
-  options: AlertWorkerOptions & { signal: AbortSignal; ciIntervalMs: number },
+  options: AlertWorkerOptions & {
+    signal: AbortSignal
+    ciIntervalMs: number
+    starIntervalMs?: number
+  },
 ) {
   const worker = createGitHubAlertWorker(options)
   const { signal, report, ciIntervalMs } = options
@@ -245,8 +298,11 @@ export async function runGitHubAlerts(
   }
 
   await Promise.all([
-    run('ci', () => worker.pollCi(), ciIntervalMs),
+    options.queryCi ? run('ci', () => worker.pollCi(), ciIntervalMs) : undefined,
     options.queryInbox ? run('inbox', () => worker.pollInbox(), inboxIntervalMs) : undefined,
+    options.queryStars
+      ? run('stars', () => worker.pollStars(signal), options.starIntervalMs ?? starIntervalMs)
+      : undefined,
     options.webhookRepository
       ? run('webhook', () => worker.processWebhooks(), webhookIntervalMs)
       : undefined,

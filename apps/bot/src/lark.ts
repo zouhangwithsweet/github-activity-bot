@@ -10,6 +10,7 @@ import { openGitHubAlertStore } from './github-alert-store.ts'
 import { runGitHubAlerts } from './github-alert-worker.ts'
 import { createPullRequestMerger } from './github-merge.ts'
 import { createPullRequestPreviewQuery } from './github-preview.ts'
+import { createGitHubStarQueries } from './github-stars.ts'
 import { createGitHubWebhookServer } from './github-webhook.ts'
 import {
   createPublicRepositoryQuery,
@@ -41,6 +42,13 @@ async function main() {
   const testGroupId = process.env.LARK_TEST_GROUP_CHAT_ID?.trim()
   const alertsEnabled = process.env.LARK_GITHUB_ALERTS?.trim() === '1'
   const ciPollSeconds = Number(process.env.GH_ACTIVITY_POLL_SECONDS?.trim() || 120)
+  const starRepoSource = process.env.GH_STAR_REPO_SOURCE?.trim() || undefined
+  const starRepositories = (process.env.GH_STAR_REPOSITORIES ?? '')
+    .split(',')
+    .map((repository) => repository.trim())
+    .filter(Boolean)
+  const starsEnabled = Boolean(starRepoSource || starRepositories.length)
+  const starPollSeconds = Number(process.env.GH_STAR_POLL_SECONDS?.trim() || 300)
   const webhookSecret = process.env.GH_WEBHOOK_SECRET?.trim()
   const webhookRepository = process.env.GH_WEBHOOK_REPOSITORY?.trim()
   const webhookPort = Number(process.env.GH_WEBHOOK_PORT?.trim() || 8787)
@@ -58,8 +66,24 @@ async function main() {
   if (testGroupId && (!testGroupId.startsWith('oc_') || !ownerOpenId)) {
     throw new Error('Set LARK_TEST_GROUP_CHAT_ID to a group chat_id and set LARK_OWNER_OPEN_ID.')
   }
-  if (alertsEnabled && !ownerOpenId) {
+  if ((alertsEnabled || starsEnabled) && !ownerOpenId) {
     throw new Error('Set LARK_OWNER_OPEN_ID to enable GitHub alerts.')
+  }
+  if (
+    starRepoSource !== undefined &&
+    starRepoSource !== 'watched' &&
+    starRepoSource !== 'accessible'
+  ) {
+    throw new Error('GH_STAR_REPO_SOURCE must be watched or accessible.')
+  }
+  if (starRepositories.some((repository) => !isRepositoryName(repository))) {
+    throw new Error('GH_STAR_REPOSITORIES must contain comma-separated owner/repo names.')
+  }
+  if (
+    starsEnabled &&
+    (!Number.isInteger(starPollSeconds) || starPollSeconds < 60 || starPollSeconds > 86400)
+  ) {
+    throw new Error('GH_STAR_POLL_SECONDS must be a whole number between 60 and 86400.')
   }
   if (webhookSecret || webhookRepository) {
     if (
@@ -111,6 +135,15 @@ async function main() {
     process.env.LARK_MEMORY_DIR?.trim() || join(homedir(), '.local', 'state', 'github-activity-bot')
   const queryCi = alertsEnabled ? createPullRequestActivityQuery() : undefined
   const queryInbox = alertsEnabled ? createGitHubNotificationsQuery() : undefined
+  const queryStars = starsEnabled
+    ? createGitHubStarQueries({
+        source: starRepoSource,
+        repositories: starRepositories,
+      })
+    : undefined
+  if (starsEnabled && !queryStars) {
+    throw new Error('Set GH_TOKEN or GH_ORG_TOKEN to enable Star polling.')
+  }
   const memory = ownerOpenId ? openLarkMemory(stateDir, { appId, ownerOpenId }) : undefined
   const openSession = (tools: GitHubConversationTools, resume?: string) =>
     openGitHubConversation(tools, shutdown.signal, memory && { cwd: memory.cwd, resume })
@@ -202,7 +235,8 @@ async function main() {
     pendingMerges.add(result)
     return result.finally(() => pendingMerges.delete(result))
   }
-  const alertStore = memory && queryCi ? openGitHubAlertStore(memory.databasePath) : undefined
+  const alertStore =
+    memory && (queryCi || queryStars) ? openGitHubAlertStore(memory.databasePath) : undefined
   const webhook =
     alertStore && webhookSecret && webhookRepository
       ? createGitHubWebhookServer({
@@ -394,17 +428,18 @@ async function main() {
   }
   const alertWorker =
     alertStore &&
-    queryCi &&
     runGitHubAlerts({
       store: alertStore,
       recipientOpenId: ownerOpenId,
       queryCi,
       queryChecks: configuredChecksQuery,
       queryInbox,
+      queryStars,
       webhookRepository,
       send: createLarkAlertSender(channel.rawClient.im.v1.message, redact),
       signal: shutdown.signal,
       ciIntervalMs: ciPollSeconds * 1_000,
+      starIntervalMs: starPollSeconds * 1_000,
       report: (stage, fields) =>
         console.log(
           JSON.stringify({

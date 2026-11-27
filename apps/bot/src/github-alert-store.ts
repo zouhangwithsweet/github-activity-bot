@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import type { GitHubWebhookEvent } from './github-webhook.ts'
-import type { CheckState } from './github.ts'
+import { isRepositoryName, type CheckState } from './github.ts'
 
 export interface CiObservation {
   repository: string
@@ -143,6 +143,12 @@ export function openGitHubAlertStore(databasePath: string) {
         PRIMARY KEY (repository, pr_number)
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS github_star_counts (
+        repository TEXT PRIMARY KEY,
+        star_count INTEGER NOT NULL CHECK (star_count >= 0),
+        observed_at_ms INTEGER NOT NULL
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS github_alert_outbox (
         id TEXT PRIMARY KEY,
         recipient_open_id TEXT NOT NULL,
@@ -234,6 +240,15 @@ export function openGitHubAlertStore(databasePath: string) {
         SELECT rowid FROM github_inbox_tracked_prs
         ORDER BY observed_at_ms DESC, position LIMIT -1 OFFSET ?
       )
+    `)
+    const getStarCount = database.prepare(`
+      SELECT star_count AS starCount, observed_at_ms AS observedAtMs
+      FROM github_star_counts WHERE repository = ?
+    `)
+    const saveStarCount = database.prepare(`
+      INSERT INTO github_star_counts (repository, star_count, observed_at_ms) VALUES (?, ?, ?)
+      ON CONFLICT (repository) DO UPDATE SET
+        star_count = excluded.star_count, observed_at_ms = excluded.observed_at_ms
     `)
     const queue = database.prepare(`
       INSERT INTO github_alert_outbox (id, recipient_open_id, text, status, due_at_ms)
@@ -400,6 +415,35 @@ export function openGitHubAlertStore(databasePath: string) {
           repository: row.repository as string,
           number: row.number as number,
         }))
+      },
+      observeStarCount(
+        repository: string,
+        starCount: number,
+        recipientOpenId: string,
+        observedAtMs: number,
+      ): number {
+        if (!isRepositoryName(repository))
+          throw new Error('Expected a GitHub repository as owner/repo.')
+        if (!Number.isSafeInteger(starCount) || starCount < 0) {
+          throw new Error('Expected a nonnegative integer Star count.')
+        }
+        return transaction(() => {
+          const repositoryKey = repository.toLowerCase()
+          const previous = getStarCount.get(repositoryKey) as
+            | { starCount: number; observedAtMs: number }
+            | undefined
+          if (previous && observedAtMs <= previous.observedAtMs) return 0
+
+          saveStarCount.run(repositoryKey, starCount, observedAtMs)
+          if (!previous || starCount <= previous.starCount) return 0
+          const message = [
+            `GitHub Star · ${repository}`,
+            `净增 ${starCount - previous.starCount} · 当前 ${starCount}`,
+            `https://github.com/${repository}`,
+          ].join('\n')
+          queue.run(randomUUID(), recipientOpenId, message, observedAtMs)
+          return 1
+        })
       },
       receiveWebhook(deliveryId: string, event: GitHubWebhookEvent, nowMs: number): boolean {
         return Boolean(

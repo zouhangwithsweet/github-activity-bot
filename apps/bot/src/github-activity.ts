@@ -72,7 +72,7 @@ function delayInMilliseconds(value: string | null) {
   if (Number.isSafeInteger(milliseconds) && milliseconds > 0) return milliseconds
 }
 
-function retryDelay(headers: Headers) {
+export function retryDelay(headers: Headers) {
   const retryAfter = headers.get('retry-after')
   const seconds = delayInMilliseconds(retryAfter)
   const retryDate = retryAfter && /[A-Za-z]/.test(retryAfter) ? Date.parse(retryAfter) : NaN

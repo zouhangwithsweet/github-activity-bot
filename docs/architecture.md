@@ -26,7 +26,7 @@ flowchart TB
       MERGE_STORE[("同一应用和账号目录的 merge.sqlite<br/>合并确认 · 执行结果")]
       HTTP["Fastify Webhook · 本机回环<br/>原始请求体验签"]
       EVENTS["Webhook 后台处理<br/>star / fork · PR 与 CI 刷新"]
-      WATCH["GitHub 只读轮询<br/>PR 头提交与 CI · 可选个人通知"]
+      WATCH["GitHub 只读轮询<br/>PR 与 CI · 个人通知 · Star"]
       SEND["提醒发送器<br/>绑定账号私聊 · 稳定投递键"]
     end
 
@@ -59,7 +59,7 @@ flowchart TB
     STORE -->|"领取 / 恢复收件记录"| EVENTS
     EVENTS -->|"star / fork 提醒入队"| STORE
     EVENTS -->|"刷新 PR 最新提交"| WATCH
-    GITHUB <-->|"定期查询 · 收件箱条件请求"| WATCH
+    GITHUB <-->|"定期查询 · GitHub 通知与 Star"| WATCH
     WATCH -->|"直接用 SQLite 事务更新状态并入队"| STORE
     STORE <-->|"领取待发送记录 / 记录结果"| SEND
     SEND -->|"仅发绑定账号私聊"| CHANNEL
@@ -108,9 +108,10 @@ PR 评审从 GitHub 部署记录选取当前 head 的成功 Vercel 预览，在�
 | --- | --- |
 | CI 轮询 | 关注本人发起、显式跟踪和个人通知发现的 PR，首次建立基线。状态变化时以当前 head SHA 为准。 |
 | 个人通知 | 配置通知凭据后轮询近期相关线程，按 GitHub 返回的间隔处理，覆盖评审请求、提及和评论等。 |
+| Star 轮询 | 可以选当前账号 Watch 的仓库、凭据可列出的仓库或指定名单。首次读取建立基线。总数增长时，在私聊按仓库发净增量和当前总数。 |
 | GitHub App Webhook | 一个已配置仓库。现有 HTTPS 代理转发到本机回环 Fastify。原始请求体验签后，按 delivery ID 写入收件记录。star、fork 可直接入队，PR 和 CI 事件触发只读刷新。 |
 
-启用提醒需设置 `LARK_GITHUB_ALERTS=1`。CI 轮询和 Webhook 共用状态与去重规则。状态变更和待发送记录在同一个 SQLite 事务里写入。发送器使用稳定的投递 UUID，重启后继续处理明确待发的记录，暂时无法判断发送结果的记录保留供核对。[Webhook 接入](../apps/bot/src/github-webhook.ts) · [提醒后台](../apps/bot/src/github-alert-worker.ts) · [状态和去重](../apps/bot/src/github-alert-store.ts)
+CI、私聊通知和 Webhook 用 `LARK_GITHUB_ALERTS=1` 启用。Star 轮询由仓库范围配置启用。状态变更和待发送记录在同一个 SQLite 事务里写入。发送器使用稳定的投递 UUID，重启后继续处理明确待发的记录，暂时无法判断发送结果的记录保留供核对。[Webhook 接入](../apps/bot/src/github-webhook.ts) · [Star 查询](../apps/bot/src/github-stars.ts) · [提醒后台](../apps/bot/src/github-alert-worker.ts) · [状态和去重](../apps/bot/src/github-alert-store.ts)
 
 ## 本地数据
 
