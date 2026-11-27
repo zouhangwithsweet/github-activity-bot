@@ -4,20 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "prs": "node --env-file-if-exists=.env src/cli.ts",
-    "lark": "node --env-file-if-exists=.env src/lark.ts",
-    "check": "vp check",
-    "format": "vp fmt .",
-    "test": "node --test"
-  },
-  "dependencies": {
-    "@botiverse/oar": "0.136.0",
-    "@larksuiteoapi/node-sdk": "1.77.0"
-  },
-  "devDependencies": {
-    "@types/node": "^24.19.4",
-    "typescript": "^6.0.3",
-    "vite-plus": "1.5.0"
+    "prs": "node --env-file-if-exists=.env apps/bot/src/cli.ts",
+    "lark": "node --env-file-if-exists=.env apps/bot/src/lark.ts",
+    "check": "pnpm --dir apps/bot run check",
+    "format": "pnpm --dir apps/bot run format",
+    "test": "pnpm --dir apps/bot run test",
+    "db:generate": "pnpm --dir apps/bot run db:generate",
+    "desktop:build": "cd apps/desktop && go tool mygo build"
   },
   "engines": {
     "node": "^24.11.0 || >=26.0.0"

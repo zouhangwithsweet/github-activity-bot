@@ -1,0 +1,12 @@
+{
+  "name": "GitHub Activity Bot",
+  "identifier": "local.github-activity-bot.desktop",
+  "version": "0.1.0",
+  "icon": "resources/icon.png",
+  "macos": {
+    "minimumSystemVersion": "13.0",
+    "infoPlist": {
+      "LSUIElement": true
+    }
+  }
+}
