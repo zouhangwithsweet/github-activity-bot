@@ -72,11 +72,18 @@
 
 ## 会话记忆
 
-SQLite 默认保存在 `~/.local/state/github-activity-bot`，可通过 `LARK_MEMORY_DIR` 修改。数据按 Lark 应用和绑定账号隔离，保存会话 ID、群线程路由和 GitHub 结果的群聊可见性依据。会话正文保存在本机 Codex 的会话历史里。该历史不存在时，Bot 会开启新会话。
+SQLite 默认保存在 `~/.local/state/github-activity-bot`，可通过 `LARK_MEMORY_DIR` 修改。数据按 Lark 应用和绑定账号隔离，保存 Codex 会话 ID、最近使用时间、创建原因、群线程路由和群聊可见性依据。Bot 打开会话后立即保存 ID，超时后重试和重启后追问时优先恢复原会话。确认原会话丢失或已归档时，Bot 才会替换它。
+
+在 Codex 会话列表里，可用「GitHub Bot · 私聊」「GitHub Bot · 群话题」「GitHub Bot · PR 评审」区分用途。私聊与每个群话题分别续接，PR 评审使用独立会话。会话正文保存在本机 Codex 历史里。
+
+绑定账号可以在私聊或已有群话题内使用以下命令，Bot 会在本地处理。
+
+- `/session` 查看当前会话状态。私聊还会显示 Codex 会话 ID。
+- `/session reset` 在当前范围内排队重置。下一次普通问答开启新会话，旧会话保留在本机 Codex 历史里。
 
 会话记忆通过 Drizzle 读写原有的 `memory.sqlite`。表定义在 `apps/bot/src/db/memory-schema.ts`，改动后运行 `pnpm db:generate --name <变更名>` 生成迁移。Bot 启动时自动应用 `apps/bot/drizzle/memory` 中的新迁移。
 
-验证时，先用自然语言问某个 PR 的 CI，再重启 Bot，在同一私聊或群线程追问「只看最新提交」。Bot 会承接前一轮的 PR，并重新查询 GitHub。
+验证时，先用自然语言问某个 PR 的 CI，再重启 Bot，在同一私聊或群线程追问「只看最新提交」。Bot 会承接前一轮的 PR，并重新查询 GitHub。在私聊里用 `/session` 对照重启前后的会话 ID。
 
 ## GitHub 私聊提醒
 

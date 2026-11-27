@@ -16,38 +16,55 @@ interface Conversation<Answer> {
   close(): Promise<void>
 }
 
+type SessionCreationReason = 'first_use' | 'missing' | 'archived' | 'manual_reset'
+
+export type LarkSessionEvent =
+  | { action: 'opened' | 'replaced'; id: string; reason: SessionCreationReason }
+  | { action: 'resumed'; id: string }
+
 export async function openRememberedConversation<Answer>(
   scope: string,
-  memory: Pick<LarkMemory, 'getSession' | 'saveSession' | 'forgetSession'> | undefined,
+  memory: Pick<LarkMemory, 'getSessionInfo' | 'saveSession' | 'touchSession'> | undefined,
   open: (resume?: string) => Promise<Conversation<Answer> & { id: string }>,
+  onEvent?: (event: LarkSessionEvent) => void,
 ): Promise<Conversation<Answer>> {
   if (!memory) return open()
-  let savedId = memory.getSession(scope)
+  const saved = memory.getSessionInfo(scope)
+  const resume = saved?.resetRequested ? undefined : saved?.nativeId
+  let reason: SessionCreationReason = saved?.resetRequested ? 'manual_reset' : 'first_use'
   let session: Conversation<Answer> & { id: string }
   try {
-    session = await open(savedId)
+    session = await open(resume)
   } catch (error) {
     if (
-      !savedId ||
+      !resume ||
       !(error instanceof CodexAnswerError) ||
       error.diagnostic.stage !== 'session_start' ||
-      error.diagnostic.code !== 'session_not_found'
+      (error.diagnostic.code !== 'session_not_found' &&
+        error.diagnostic.code !== 'session_archived')
     ) {
       throw error
     }
-    memory.forgetSession(scope, savedId)
-    savedId = undefined
+    reason = error.diagnostic.code === 'session_archived' ? 'archived' : 'missing'
     session = await open()
+  }
+
+  try {
+    if (resume === session.id) {
+      onEvent?.({ action: 'resumed', id: session.id })
+    } else {
+      memory.saveSession(scope, session.id, reason)
+      onEvent?.({ action: saved ? 'replaced' : 'opened', id: session.id, reason })
+    }
+  } catch (error) {
+    await session.close().catch(() => undefined)
+    throw error
   }
 
   return {
     answer: async (question) => {
-      const answer = await session.answer(question)
-      if (savedId !== session.id) {
-        memory.saveSession(scope, session.id)
-        savedId = session.id
-      }
-      return answer
+      memory.touchSession(scope, session.id)
+      return session.answer(question)
     },
     close: async () => session.close(),
   }
@@ -57,6 +74,12 @@ interface ChatConversation<Answer> {
   session?: Conversation<Answer>
   pending: Promise<unknown>
   idleTimer?: ReturnType<typeof setTimeout>
+}
+
+async function closeChatSession<Answer>(chat: ChatConversation<Answer>) {
+  const session = chat.session
+  chat.session = undefined
+  await session?.close()
 }
 
 interface LarkProgress {
@@ -94,9 +117,9 @@ export function createLarkConversations<Answer>(
   const chats = new Map<string, ChatConversation<Answer>>()
   let closing: Promise<void> | undefined
 
-  async function run<Result>(
+  async function enqueue<Result>(
     chatId: string,
-    work: (answer: (question: string) => Promise<Answer>) => Promise<Result>,
+    work: (slot: ChatConversation<Answer>) => Promise<Result>,
   ) {
     if (closing) throw new Error('Lark conversations are closing.')
     let chat = chats.get(chatId)
@@ -109,17 +132,7 @@ export function createLarkConversations<Answer>(
 
     const turn = slot.pending.then(() => {
       if (closing) throw new Error('Lark conversations are closing.')
-      return work(async (question) => {
-        try {
-          slot.session ??= await open(chatId)
-          return await slot.session.answer(question)
-        } catch (error) {
-          const session = slot.session
-          slot.session = undefined
-          await session?.close().catch(() => undefined)
-          throw error
-        }
-      })
+      return work(slot)
     })
     const pending = turn.catch(() => undefined)
     slot.pending = pending
@@ -136,8 +149,32 @@ export function createLarkConversations<Answer>(
     return turn
   }
 
+  function run<Result>(
+    chatId: string,
+    work: (answer: (question: string) => Promise<Answer>) => Promise<Result>,
+  ) {
+    return enqueue(chatId, (slot) =>
+      work(async (question) => {
+        try {
+          slot.session ??= await open(chatId)
+          return await slot.session.answer(question)
+        } catch (error) {
+          await closeChatSession(slot).catch(() => undefined)
+          throw error
+        }
+      }),
+    )
+  }
+
   return {
     run,
+    reset(chatId: string, requestReset: () => boolean) {
+      return enqueue(chatId, async (slot) => {
+        if (!requestReset()) return false
+        await closeChatSession(slot)
+        return true
+      })
+    },
     async answer(this: void, question: string, chatId: string) {
       return run(chatId, (answer) => answer(question))
     },
@@ -156,6 +193,41 @@ export function createLarkConversations<Answer>(
   }
 }
 
+export type LarkSessionCommand = 'status' | 'reset'
+
+export function parseLarkSessionCommand(text: string): LarkSessionCommand | undefined {
+  switch (text.trim().toLowerCase()) {
+    case '/session':
+      return 'status'
+    case '/session reset':
+      return 'reset'
+  }
+}
+
+const sessionCreationLabels: Record<SessionCreationReason, string> = {
+  first_use: '首次使用',
+  missing: '原会话缺失',
+  archived: '原会话已归档',
+  manual_reset: '手动重置',
+}
+
+export function larkSessionStatus(memory: Pick<LarkMemory, 'getSessionInfo'>, scope: string) {
+  const session = memory.getSessionInfo(scope)
+  if (!session) return '当前聊天还没有 Codex 会话。'
+  if (session.resetRequested) return '当前会话已重置。下次问答时会开启新会话。'
+  const lines = ['当前聊天已绑定 Codex 会话。']
+  if (scope.startsWith('dm:')) lines.push(`Codex ID：${session.nativeId}`)
+  if (session.lastUsedAt !== null) {
+    lines.push(`上次使用（UTC）：${new Date(session.lastUsedAt).toISOString()}`)
+  }
+  if (session.creationReason && Object.hasOwn(sessionCreationLabels, session.creationReason)) {
+    lines.push(
+      `创建原因：${sessionCreationLabels[session.creationReason as SessionCreationReason]}`,
+    )
+  }
+  return lines.join('\n')
+}
+
 type ConversationEvent =
   | { event: 'received'; text: string; source?: 'merge' | 'review' }
   | { event: 'processing_failed'; source: 'codex'; error: unknown }
@@ -168,12 +240,13 @@ interface HandlerOptions {
   getQuote: GetLarkQuote
   merge?: ReturnType<typeof createLarkMergeFlow>['answerDm']
   review?: (request: PullRequestReviewRequest | 'invalid') => Promise<string>
+  sessionCommand?: (command: LarkSessionCommand, chatId: string) => Promise<string>
   onUnconfiguredOwner: (openId: string) => void
   onEvent?: (event: ConversationEvent) => void
 }
 
 const help =
-  '发 /prs 查看开放的 PR，或发 /failed 查看 CI 失败的 PR。也可以直接问「我有哪些 PR 卡在 CI？」。'
+  '发 /prs 查看开放的 PR，/failed 查看 CI 失败的 PR，或 /session 查看当前会话。也可以直接问「我有哪些 PR 卡在 CI？」。'
 const openCommands = new Set(['我的 pr', '/prs'])
 const failedCommands = new Set(['ci 失败', '/failed'])
 
@@ -189,6 +262,10 @@ export async function answerLarkMessage(message: LarkMessage, options: HandlerOp
 
   const question = message.content.trim()
   if (!question) return
+  const sessionCommand = parseLarkSessionCommand(question)
+  if (sessionCommand && options.sessionCommand) {
+    return options.sessionCommand(sessionCommand, message.chatId)
+  }
   const mergeIntent = options.merge && parseLarkMergeIntent(question)
   if (mergeIntent && options.merge) {
     options.onEvent?.({ event: 'received', text: mergeIntent.kind, source: 'merge' })

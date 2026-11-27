@@ -100,12 +100,15 @@ async function atCodexStage<T>(stage: CodexStage, run: () => Promise<T>): Promis
   try {
     return await run()
   } catch (error) {
+    if (stage === 'session_start' && error instanceof SessionNotFoundError) {
+      throw new CodexAnswerError({ stage, code: 'session_not_found' })
+    }
     if (
       stage === 'session_start' &&
-      (error instanceof SessionNotFoundError ||
-        (error instanceof SessionUnavailableError && error.reason === 'archived'))
+      error instanceof SessionUnavailableError &&
+      error.reason === 'archived'
     ) {
-      throw new CodexAnswerError({ stage, code: 'session_not_found' })
+      throw new CodexAnswerError({ stage, code: 'session_archived' })
     }
     // Native error messages may contain request details. Keep only classified diagnostics.
     const cause = error instanceof Error ? error.cause : undefined
@@ -220,6 +223,7 @@ export async function openGitHubConversation(
   github: GitHubConversationTools,
   signal?: AbortSignal,
   memory?: { cwd: string; resume?: string },
+  name?: string,
 ) {
   signal?.throwIfAborted()
   const installation = await requireCodexInstallation()
@@ -324,6 +328,7 @@ export async function openGitHubConversation(
     codex.session(installation, {
       cwd,
       resume: memory?.resume,
+      name,
       env: {
         ...removedCredentials,
         NO_PROXY: noProxy,
@@ -367,6 +372,7 @@ export async function reviewPullRequestWithCodex(
   const session = await atCodexStage('session_start', () =>
     codex.session(installation, {
       cwd,
+      name: 'GitHub Bot · PR 评审',
       env: { ...removedCredentials, [toolTokenEnv]: null },
       launchArgs: [...launchArgs, '-c', `mcp_servers={${disabled.join(',')}}`],
       systemPrompt: reviewInstructions,

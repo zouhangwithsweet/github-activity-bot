@@ -13,7 +13,7 @@ flowchart TB
 
     subgraph Host["本机 GitHub Agent 服务 · apps/bot"]
       CHANNEL["Lark 适配器<br/>识别请求者 · 同聊引用 · 回复原处"]
-      SESSION["会话与任务调度<br/>私聊/群线程 · 后台查询"]
+      SESSION["会话与任务调度<br/>按私聊或群话题排队 · 查询与重置"]
       MERGE["单 PR 合并<br/>本人私聊 · 预览后确认"]
       OAR["OAR 会话接口"]
       CODEX["本机 Codex"]
@@ -37,7 +37,7 @@ flowchart TB
     DM <-->|"收消息 / 回复"| CHANNEL
     GROUP <-->|"群主聊天或原话题收发"| CHANNEL
     CHANNEL -->|"当前查询命令"| TOOLS
-    CHANNEL -->|"问题 + 引用 + 会话位置"| SESSION
+    CHANNEL -->|"问题 + 引用 + 会话位置 / 会话命令"| SESSION
     CHANNEL -->|"本人私聊 PR 链接或 /review"| PR_REVIEW
     PR_REVIEW -->|"获取 diff 和当前提交的 Vercel 部署"| TOOLS
     PR_REVIEW -->|"截图指定路由"| CAPTURE
@@ -50,7 +50,7 @@ flowchart TB
     OAR <--> CODEX
     SESSION -.->|"可选宿主适配"| T3
     CODEX -->|"调用只读 MCP 工具"| TOOLS
-    SESSION <-->|"保存 / 恢复会话与投递范围"| MEMORY
+    SESSION <-->|"打开即保存会话 ID · 最近使用与创建原因"| MEMORY
     MEMORY <-->|"通过 node:sqlite 读写会话"| STORE
     SESSION -->|"回复对应群聊或私聊"| CHANNEL
     TOOLS -->|"实时查询"| GITHUB
@@ -86,9 +86,12 @@ MyGo 和 CLI 都以仓库根目录为 Bot 的工作目录。桌面端优先启�
 | 本人在群里 @ Bot | 即时回复「好的，收到！」，普通问答的结果接着在群聊原处发出。 |
 | 本人引用群消息并 @ Bot | 只 @ 时，概括同事的请求，能确定 PR 时查实时 CI 与评审，并建议下一步。带附言时按附言处理。 |
 | 已登记群线程追问 | 绑定账号在同一线程继续使用该线程的会话。 |
+| 本人私聊或已有群话题里的 `/session` 与 `/session reset` | 宿主查询当前范围的会话状态，或将重置加入该范围的队列。Codex 会话 ID 只在私聊返回。 |
 | 本人在群里 @ Bot 并明确请求合并 | 预览或缺少的信息发给绑定账号的私聊，在群聊原处告知投递状态。 |
 
 Lark 适配器核对绑定账号、群聊范围和回复位置，使用消息 ID 读取同聊引用。引用内容作为上下文，操作意图来自本人消息。群聊和私聊分别排队与恢复会话。群聊原处接收普通问答和已确认公开的仓库查询结果。私有仓库、可见性未知和个人 PR 列表在群里提示改用私聊查询。[私聊路由](../apps/bot/src/lark-handler.ts) · [群聊路由](../apps/bot/src/lark-group.ts) · [群结果投递](../apps/bot/src/lark-group-work.ts)
+
+每个私聊或群话题复用各自的 Codex 会话。成功打开后即写入会话 ID。超时后重试沿用同一 ID，群话题空闲 30 分钟后释放进程并保留 ID。原会话确认丢失或已归档时进行替换。手动重置只作用于当前范围，等下一次普通问答才开启新会话，并保留旧 Codex 历史和群聊可见性记录。[会话生命周期](../apps/bot/src/lark-handler.ts) · [会话存储](../apps/bot/src/lark-memory.ts)
 
 OAR 为 Codex 注入 `list_my_open_prs`、`get_pull_request`、`list_pr_checks` 和 `get_pull_request_reviews` 四个只读 MCP 工具。查询凭据留在宿主，Codex 启动时移除继承的凭据环境变量。[OAR 与 MCP](../apps/bot/src/agent.ts) · [GitHub 查询](../apps/bot/src/github.ts)
 
@@ -117,7 +120,7 @@ CI、私聊通知和 Webhook 用 `LARK_GITHUB_ALERTS=1` 启用。Star 轮询由�
 
 | 数据 | 位置与用途 |
 | --- | --- |
-| `memory.sqlite` | 由 Lark 应用和绑定账号隔离。Drizzle 保存原生会话 ID、群线程路由和群聊结果可见性标记。提醒后台用 SQLite 事务保存 CI 观测、个人通知游标、Webhook 收件和待发送记录。 |
+| `memory.sqlite` | 由 Lark 应用和绑定账号隔离。Drizzle 保存原生会话 ID、最近使用时间、创建原因、群线程路由和群聊结果可见性标记。提醒后台用 SQLite 事务保存 CI 观测、个人通知游标、Webhook 收件和待发送记录。 |
 | `merge.sqlite` | 同一身份目录内的合并确认、预览快照和执行结果。 |
 | Codex 会话正文 | 由 Codex 原生会话维护。Bot 用存下的会话 ID 续接。 |
 

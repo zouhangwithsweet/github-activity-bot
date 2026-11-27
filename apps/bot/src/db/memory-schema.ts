@@ -4,6 +4,9 @@ import { index, integer, primaryKey, sqliteTable, text, unique } from 'drizzle-o
 export const sessions = sqliteTable('sessions', {
   scope: text().primaryKey(),
   nativeId: text('native_id').notNull(),
+  lastUsedAt: integer('last_used_at'),
+  creationReason: text('creation_reason'),
+  resetRequested: integer('reset_requested', { mode: 'boolean' }).notNull().default(false),
 })
 
 export const groupAnchors = sqliteTable(

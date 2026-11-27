@@ -18,6 +18,13 @@ export interface LarkGroupAnchor {
   threadId?: string
 }
 
+export interface LarkSessionInfo {
+  nativeId: string
+  lastUsedAt: number | null
+  creationReason: string | null
+  resetRequested: boolean
+}
+
 const maxGroupAnchors = 4_096
 
 export function openLarkMemory(stateDir: string, identity: { appId: string; ownerOpenId: string }) {
@@ -45,11 +52,49 @@ export function openLarkMemory(stateDir: string, identity: { appId: string; owne
           .where(eq(sessions.scope, scope))
           .get()?.nativeId
       },
-      saveSession(scope: string, nativeId: string) {
+      getSessionInfo(scope: string): LarkSessionInfo | undefined {
+        return db
+          .select({
+            nativeId: sessions.nativeId,
+            lastUsedAt: sessions.lastUsedAt,
+            creationReason: sessions.creationReason,
+            resetRequested: sessions.resetRequested,
+          })
+          .from(sessions)
+          .where(eq(sessions.scope, scope))
+          .get()
+      },
+      saveSession(scope: string, nativeId: string, creationReason?: string) {
+        const details = {
+          nativeId,
+          lastUsedAt: Date.now(),
+          creationReason: creationReason ?? null,
+          resetRequested: false,
+        }
         db.insert(sessions)
-          .values({ scope, nativeId })
-          .onConflictDoUpdate({ target: sessions.scope, set: { nativeId } })
+          .values({ scope, ...details })
+          .onConflictDoUpdate({ target: sessions.scope, set: details })
           .run()
+      },
+      touchSession(scope: string, nativeId: string) {
+        db.update(sessions)
+          .set({ lastUsedAt: Date.now() })
+          .where(
+            and(
+              eq(sessions.scope, scope),
+              eq(sessions.nativeId, nativeId),
+              eq(sessions.resetRequested, false),
+            ),
+          )
+          .run()
+      },
+      requestSessionReset(scope: string) {
+        const { changes } = db
+          .update(sessions)
+          .set({ resetRequested: true })
+          .where(eq(sessions.scope, scope))
+          .run()
+        return changes > 0
       },
       forgetSession(scope: string, nativeId: string) {
         db.delete(sessions)

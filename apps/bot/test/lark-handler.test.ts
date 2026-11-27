@@ -101,6 +101,25 @@ await test('keeps overlapping natural-language turns ordered in each chat', asyn
   assert.deepEqual(closed, calls)
 })
 
+await test('only the bound owner can request a private session operation', async () => {
+  const calls: string[] = []
+  const options: Parameters<typeof answerLarkMessage>[1] = {
+    ownerOpenId: 'ou_owner',
+    query: async () => assert.fail('Unexpected GitHub query'),
+    run: async () => assert.fail('Unexpected Codex request'),
+    getQuote: unusedQuote,
+    sessionCommand: async (command, chatId) => {
+      calls.push(`${command}:${chatId}`)
+      return '会话状态'
+    },
+    onUnconfiguredOwner: () => assert.fail('Unexpected discovery mode'),
+  }
+  const command = { ...message, content: '/session reset' }
+  assert.equal(await answerLarkMessage({ ...command, senderId: 'ou_other' }, options), undefined)
+  assert.equal(await answerLarkMessage(command, options), '会话状态')
+  assert.deepEqual(calls, ['reset:oc_owner'])
+})
+
 await test('skips progress on quick replies and clears a reaction that arrives late', async () => {
   const started = Promise.withResolvers<void>()
   const shown = Promise.withResolvers<string>()

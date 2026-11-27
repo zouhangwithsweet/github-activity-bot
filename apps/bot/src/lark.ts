@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createLarkChannel, Domain, LarkChannelError, LoggerLevel } from '@larksuiteoapi/node-sdk'
@@ -26,8 +27,12 @@ import { processLarkGroupTurn, trackGroupGitHubAccess } from './lark-group-work.
 import {
   answerLarkMessage,
   createLarkConversations,
+  larkSessionStatus,
   openRememberedConversation,
+  parseLarkSessionCommand,
   startLarkProgress,
+  type LarkSessionCommand,
+  type LarkSessionEvent,
 } from './lark-handler.ts'
 import { openLarkMemory } from './lark-memory.ts'
 import { createLarkMergeFlow } from './lark-merge.ts'
@@ -145,11 +150,31 @@ async function main() {
     throw new Error('Set GH_TOKEN or GH_ORG_TOKEN to enable Star polling.')
   }
   const memory = ownerOpenId ? openLarkMemory(stateDir, { appId, ownerOpenId }) : undefined
-  const openSession = (tools: GitHubConversationTools, resume?: string) =>
-    openGitHubConversation(tools, shutdown.signal, memory && { cwd: memory.cwd, resume })
-  const conversations = createLarkConversations((chatId) =>
-    openRememberedConversation(`dm:${chatId}`, memory, (resume) => openSession(github, resume)),
-  )
+  const logSession = (
+    scope: string,
+    { action, ...fields }: LarkSessionEvent | { action: 'reset_requested' | 'command_failed' },
+  ) => {
+    console.log(
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: `lark.session_${action}`,
+        kind: scope.startsWith('dm:') ? 'dm' : 'group',
+        scope: createHash('sha256').update(scope).digest('hex').slice(0, 12),
+        ...fields,
+      }),
+    )
+  }
+  const openSession = (tools: GitHubConversationTools, name: string, resume?: string) =>
+    openGitHubConversation(tools, shutdown.signal, memory && { cwd: memory.cwd, resume }, name)
+  const conversations = createLarkConversations((chatId) => {
+    const scope = `dm:${chatId}`
+    return openRememberedConversation(
+      scope,
+      memory,
+      (resume) => openSession(github, 'GitHub Bot · 私聊', resume),
+      (event) => logSession(scope, event),
+    )
+  })
   const groups = createLarkGroupRouter({
     ownerOpenId,
     allowedChatIds: testGroupId ? [testGroupId] : [],
@@ -158,18 +183,41 @@ async function main() {
   const publicRepository = createPublicRepositoryQuery()
   const groupConversations = createLarkConversations(async (scope) => {
     const access = trackGroupGitHubAccess(github, publicRepository, memory && { scope, memory })
-    return openRememberedConversation(scope, memory, async (resume) => {
-      const conversation = await openSession(access.tools, resume)
-      return {
-        id: conversation.id,
-        answer: async (question: string) => {
-          const text = await conversation.answer(question)
-          return { text, canReplyInGroup: await access.canReplyInGroup() }
-        },
-        close: conversation.close,
-      }
-    })
+    return openRememberedConversation(
+      scope,
+      memory,
+      async (resume) => {
+        const conversation = await openSession(access.tools, 'GitHub Bot · 群话题', resume)
+        return {
+          id: conversation.id,
+          answer: async (question: string) => {
+            const text = await conversation.answer(question)
+            return { text, canReplyInGroup: await access.canReplyInGroup() }
+          },
+          close: conversation.close,
+        }
+      },
+      (event) => logSession(scope, event),
+    )
   }, 30 * 60_000)
+  const manageSession = async (
+    command: LarkSessionCommand,
+    scope: string,
+    reset: (requestReset: () => boolean) => Promise<boolean>,
+  ) => {
+    if (!memory) return '会话记忆尚未启用。'
+    try {
+      if (command === 'status') return larkSessionStatus(memory, scope)
+      if (!(await reset(() => memory.requestSessionReset(scope)))) {
+        return '当前聊天还没有可重置的 Codex 会话。'
+      }
+      logSession(scope, { action: 'reset_requested' })
+      return '当前会话已重置。历史仍可在 Codex 里查看，下次问答时会开启新会话。'
+    } catch {
+      logSession(scope, { action: 'command_failed' })
+      return '暂时无法完成会话操作，请稍后重试。'
+    }
+  }
 
   const secrets = [
     appSecret,
@@ -278,6 +326,23 @@ async function main() {
       log('group_received')
 
       try {
+        const replyInGroup = async (text: string) => {
+          const destination = turn.threadId
+            ? { replyTo: turn.messageId, replyInThread: true }
+            : undefined
+          const reply = await channel.send(turn.chatId, { text: redact(text) }, destination)
+          if (!shutdown.signal.aborted) {
+            groups.recordReply(turn, reply.messageId, turn.threadId)
+          }
+        }
+        const sessionCommand = parseLarkSessionCommand(turn.question)
+        if (sessionCommand) {
+          const text = await manageSession(sessionCommand, turn.sessionKey, (requestReset) =>
+            groupConversations.reset(turn.sessionKey, requestReset),
+          )
+          if (!shutdown.signal.aborted) await replyInGroup(text)
+          return
+        }
         await processLarkGroupTurn(turn, {
           signal: shutdown.signal,
           run: groupConversations.run,
@@ -286,15 +351,7 @@ async function main() {
             mergeFlow &&
             ((turn, text, getQuote) =>
               trackMerge(mergeFlow.previewFromGroup(turn, text, getQuote))),
-          replyInGroup: async (text) => {
-            const destination = turn.threadId
-              ? { replyTo: turn.messageId, replyInThread: true }
-              : undefined
-            const reply = await channel.send(turn.chatId, { text: redact(text) }, destination)
-            if (!shutdown.signal.aborted) {
-              groups.recordReply(turn, reply.messageId, turn.threadId)
-            }
-          },
+          replyInGroup,
           sendPrivately: async (text) => {
             await channel.send(ownerOpenId, { text: redact(text) })
           },
@@ -321,6 +378,10 @@ async function main() {
       ownerOpenId,
       query,
       run: conversations.run,
+      sessionCommand: (command, chatId) =>
+        manageSession(command, `dm:${chatId}`, (requestReset) =>
+          conversations.reset(chatId, requestReset),
+        ),
       getQuote: getPrivateQuote,
       merge: mergeFlow && ((message, intent) => trackMerge(mergeFlow.answerDm(message, intent))),
       review: async (request) => {

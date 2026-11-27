@@ -8,7 +8,11 @@ import test from 'node:test'
 import { CodexAnswerError } from '../src/agent.ts'
 import { trackGroupGitHubAccess } from '../src/lark-group-work.ts'
 import { createLarkGroupRouter } from '../src/lark-group.ts'
-import { openRememberedConversation } from '../src/lark-handler.ts'
+import {
+  createLarkConversations,
+  larkSessionStatus,
+  openRememberedConversation,
+} from '../src/lark-handler.ts'
 import { openLarkMemory } from '../src/lark-memory.ts'
 
 const identity = { appId: 'cli_app', ownerOpenId: 'ou_owner' }
@@ -79,6 +83,12 @@ await test('adopts the handwritten memory schema and leaves the GitHub alert out
     assert.equal(memory.databasePath, databasePath)
     assert.equal(memory.getSession(group), 'legacy-group')
     assert.equal(memory.getSession(dm), 'legacy-dm')
+    assert.deepEqual(memory.getSessionInfo(dm), {
+      nativeId: 'legacy-dm',
+      lastUsedAt: null,
+      creationReason: null,
+      resetRequested: false,
+    })
     assert.deepEqual(memory.getGroupAnchors('oc_chat'), [
       { key: 'om_first', sessionKey: group },
       { key: 'om_reply', sessionKey: group, threadId: 'omt_topic' },
@@ -133,6 +143,48 @@ await test('adopts the handwritten memory schema and leaves the GitHub alert out
     )
   } finally {
     inspected.close()
+  }
+})
+
+await test('persists pending reset without touching or deleting the remembered session', (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'lark-memory-reset-'))
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }))
+  t.mock.timers.enable({ apis: ['Date'], now: 100 })
+  const scope = 'dm:oc_private'
+  const initial = openLarkMemory(stateDir, identity)
+  try {
+    assert.equal(initial.requestSessionReset(scope), false)
+    initial.saveSession(scope, 'first', 'new')
+    assert.equal(initial.getSessionInfo(scope)?.lastUsedAt, 100)
+    t.mock.timers.setTime(200)
+    initial.touchSession(scope, 'stale')
+    assert.equal(initial.getSessionInfo(scope)?.lastUsedAt, 100)
+    initial.touchSession(scope, 'first')
+    assert.equal(initial.getSessionInfo(scope)?.lastUsedAt, 200)
+    assert.equal(initial.requestSessionReset(scope), true)
+  } finally {
+    initial.close()
+  }
+
+  const restored = openLarkMemory(stateDir, identity)
+  try {
+    t.mock.timers.setTime(300)
+    restored.touchSession(scope, 'first')
+    assert.deepEqual(restored.getSessionInfo(scope), {
+      nativeId: 'first',
+      lastUsedAt: 200,
+      creationReason: 'new',
+      resetRequested: true,
+    })
+    restored.saveSession(scope, 'replacement', 'reset')
+    assert.deepEqual(restored.getSessionInfo(scope), {
+      nativeId: 'replacement',
+      lastUsedAt: 300,
+      creationReason: 'reset',
+      resetRequested: false,
+    })
+  } finally {
+    restored.close()
   }
 })
 
@@ -273,7 +325,7 @@ await test('restores an authorized group reply anchor without losing private del
   }
 })
 
-await test('replaces a missing native ID after a successful reply and preserves it for transient errors', async (t) => {
+await test('saves a replacement as soon as it opens and preserves the prior binding on open errors', async (t) => {
   const stateDir = mkdtempSync(join(tmpdir(), 'lark-memory-'))
   t.after(() => rmSync(stateDir, { recursive: true, force: true }))
   const memory = openLarkMemory(stateDir, identity)
@@ -300,11 +352,72 @@ await test('replaces a missing native ID after a successful reply and preserves 
       }
     })
     assert.deepEqual(attempted, ['old', undefined])
-    assert.equal(memory.getSession(scope), undefined)
+    assert.equal(memory.getSession(scope), 'new')
+    assert.equal(memory.getSessionInfo(scope)?.creationReason, 'missing')
     assert.equal(await replacement.answer('只看最新提交'), 'Latest result')
     assert.equal(memory.getSession(scope), 'new')
     await replacement.close()
   } finally {
     memory.close()
+  }
+})
+
+await test('resumes the first thread after a turn timeout and Bot restart, then resets just that scope', async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'lark-memory-'))
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }))
+  const dmScope = 'dm:oc_private'
+  const groupScope = 'group:oc_group:omt_topic'
+  const opened: (string | undefined)[] = []
+  const closed: string[] = []
+  let timeout = true
+  const open = async (resume?: string) => {
+    opened.push(resume)
+    const id = resume ?? `native-${opened.length}`
+    return {
+      id,
+      answer: async () => {
+        if (timeout) {
+          timeout = false
+          throw new CodexAnswerError({ stage: 'turn', code: 'timeout' })
+        }
+        return id
+      },
+      close: async () => {
+        closed.push(id)
+      },
+    }
+  }
+  const original = openLarkMemory(stateDir, identity)
+  const first = createLarkConversations((scope) =>
+    openRememberedConversation(scope, original, open),
+  )
+  try {
+    original.saveSession(groupScope, 'group-native')
+    await assert.rejects(first.answer('first question', dmScope), CodexAnswerError)
+    assert.equal(original.getSession(dmScope), 'native-1')
+    assert.equal(original.getSessionInfo(dmScope)?.creationReason, 'first_use')
+  } finally {
+    await first.close()
+    original.close()
+  }
+
+  const restored = openLarkMemory(stateDir, identity)
+  const chats = createLarkConversations((scope) =>
+    openRememberedConversation(scope, restored, open),
+  )
+  try {
+    assert.equal(await chats.answer('retry', dmScope), 'native-1')
+    assert.match(larkSessionStatus(restored, dmScope), /native-1/)
+    assert.ok(!larkSessionStatus(restored, groupScope).includes('group-native'))
+    assert.equal(await chats.reset(dmScope, () => restored.requestSessionReset(dmScope)), true)
+    assert.match(larkSessionStatus(restored, dmScope), /已重置/)
+    assert.deepEqual(opened, [undefined, 'native-1'])
+    assert.equal(await chats.answer('next question', dmScope), 'native-3')
+    assert.equal(restored.getSessionInfo(dmScope)?.creationReason, 'manual_reset')
+    assert.equal(restored.getSession(groupScope), 'group-native')
+    assert.deepEqual(closed, ['native-1', 'native-1'])
+  } finally {
+    await chats.close()
+    restored.close()
   }
 })
